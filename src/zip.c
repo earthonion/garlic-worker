@@ -1,0 +1,261 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include "zip.h"
+#include "util.h"
+
+/* ── CRC32 ─────────────────────────────────────────────────────── */
+static uint32_t crc_tab[256];
+
+void zip_init_crc(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++) c = (c >> 1) ^ (c & 1 ? 0xEDB88320 : 0);
+        crc_tab[i] = c;
+    }
+}
+
+static uint32_t calc_crc(const uint8_t *buf, size_t len) {
+    uint32_t c = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) c = crc_tab[(c ^ buf[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFF;
+}
+
+/* ── ZIP extract (from file) ───────────────────────────────────── */
+int zip_extract_file(const char *zip_path, const char *dest_dir) {
+    int zfd = open(zip_path, O_RDONLY);
+    if (zfd < 0) return -1;
+
+    struct stat zst;
+    fstat(zfd, &zst);
+    size_t file_size = zst.st_size;
+
+    /* Read entire ZIP into memory (saves are typically < 64MB) */
+    uint8_t *data = malloc(file_size);
+    if (!data) { close(zfd); return -1; }
+
+    size_t total_read = 0;
+    while (total_read < file_size) {
+        ssize_t n = read(zfd, data + total_read, file_size - total_read);
+        if (n <= 0) break;
+        total_read += n;
+    }
+    close(zfd);
+
+    if (total_read < file_size) {
+        free(data);
+        return -1;
+    }
+
+    /* Parse ZIP entries */
+    size_t off = 0;
+    int count = 0;
+
+    while (off + 30 <= file_size) {
+        if (data[off] != 0x50 || data[off+1] != 0x4b ||
+            data[off+2] != 0x03 || data[off+3] != 0x04) break;
+
+        uint16_t compression = 0, name_len = 0, extra_len = 0;
+        uint32_t comp_size = 0, uncomp_size = 0;
+        memcpy(&compression, data + off + 8, 2);
+        memcpy(&comp_size, data + off + 18, 4);
+        memcpy(&uncomp_size, data + off + 22, 4);
+        memcpy(&name_len, data + off + 26, 2);
+        memcpy(&extra_len, data + off + 28, 2);
+
+        char name[MAX_PATH_LEN] = {0};
+        uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
+        memcpy(name, data + off + 30, copy_len);
+        off += 30 + name_len + extra_len;
+
+        if (compression != 0) {
+            printf("[Garlic] Skipping compressed entry: %s\n", name);
+            off += comp_size;
+            continue;
+        }
+
+        if (name[0] && name[strlen(name) - 1] == '/') {
+            /* Directory entry */
+            char dirpath[MAX_PATH_LEN];
+            snprintf(dirpath, sizeof(dirpath), "%s/%s", dest_dir, name);
+            mkdir_p(dirpath);
+        } else {
+            /* File entry */
+            char filepath[MAX_PATH_LEN];
+            snprintf(filepath, sizeof(filepath), "%s/%s", dest_dir, name);
+
+            /* Create parent directories */
+            char *slash = filepath;
+            while ((slash = strchr(slash + 1, '/')) != NULL) {
+                *slash = 0;
+                mkdir(filepath, 0777);
+                *slash = '/';
+            }
+
+            int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) {
+                size_t to_write = uncomp_size;
+                if (off + to_write > file_size) to_write = file_size - off;
+                write(fd, data + off, to_write);
+                close(fd);
+                count++;
+            }
+        }
+        off += comp_size;
+    }
+
+    free(data);
+    printf("[Garlic] Extracted %d files from %s\n", count, zip_path);
+    return count;
+}
+
+/* ── ZIP create helpers ────────────────────────────────────────── */
+typedef struct {
+    char name[512];
+    uint32_t crc;
+    uint32_t size;
+    uint32_t offset;
+} zip_entry_t;
+
+#define MAX_ZIP_ENTRIES 4096
+
+static void collect_files(const char *base, const char *prefix,
+                          zip_entry_t *entries, int *count) {
+    char dirpath[MAX_PATH_LEN];
+    if (prefix[0])
+        snprintf(dirpath, sizeof(dirpath), "%s/%s", base, prefix);
+    else
+        snprintf(dirpath, sizeof(dirpath), "%s", base);
+
+    DIR *d = opendir(dirpath);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) && *count < MAX_ZIP_ENTRIES) {
+        if (ent->d_name[0] == '.') continue;
+        char relpath[MAX_PATH_LEN];
+        if (prefix[0])
+            snprintf(relpath, sizeof(relpath), "%s/%s", prefix, ent->d_name);
+        else
+            snprintf(relpath, sizeof(relpath), "%s", ent->d_name);
+        char fullpath[MAX_PATH_LEN];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", base, relpath);
+        struct stat st;
+        if (stat(fullpath, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            collect_files(base, relpath, entries, count);
+        } else if (S_ISREG(st.st_mode)) {
+            zip_entry_t *e = &entries[*count];
+            snprintf(e->name, sizeof(e->name), "%s", relpath);
+            e->size = (uint32_t)st.st_size;
+            e->crc = 0;
+            e->offset = 0;
+            (*count)++;
+        }
+    }
+    closedir(d);
+}
+
+int zip_create_from_dir(const char *src_dir, const char *zip_path) {
+    zip_entry_t *entries = malloc(MAX_ZIP_ENTRIES * sizeof(zip_entry_t));
+    if (!entries) return -1;
+
+    int count = 0;
+    collect_files(src_dir, "", entries, &count);
+    if (count == 0) {
+        free(entries);
+        return -1;
+    }
+
+    int zfd = open(zip_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (zfd < 0) {
+        free(entries);
+        return -1;
+    }
+
+    uint32_t offset = 0;
+    for (int i = 0; i < count; i++) {
+        zip_entry_t *e = &entries[i];
+        e->offset = offset;
+        uint16_t nlen = strlen(e->name);
+
+        /* Read file data and compute CRC */
+        char fullpath[MAX_PATH_LEN];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->name);
+        int fd = open(fullpath, O_RDONLY);
+        uint8_t *fdata = NULL;
+        if (fd >= 0 && e->size > 0) {
+            fdata = malloc(e->size);
+            if (fdata) {
+                size_t total = 0;
+                while (total < e->size) {
+                    ssize_t r = read(fd, fdata + total, e->size - total);
+                    if (r <= 0) break;
+                    total += r;
+                }
+            }
+            close(fd);
+        } else if (fd >= 0) {
+            close(fd);
+        }
+        e->crc = fdata ? calc_crc(fdata, e->size) : 0;
+
+        /* Local file header */
+        uint8_t lh[30];
+        memset(lh, 0, 30);
+        lh[0] = 0x50; lh[1] = 0x4b; lh[2] = 0x03; lh[3] = 0x04;
+        lh[4] = 20; /* version needed */
+        memcpy(lh + 14, &e->crc, 4);
+        memcpy(lh + 18, &e->size, 4);
+        memcpy(lh + 22, &e->size, 4);
+        memcpy(lh + 26, &nlen, 2);
+        write(zfd, lh, 30);
+        write(zfd, e->name, nlen);
+        if (fdata) {
+            write(zfd, fdata, e->size);
+            free(fdata);
+        }
+        offset += 30 + nlen + e->size;
+    }
+
+    /* Central directory */
+    uint32_t cd_offset = offset;
+    for (int i = 0; i < count; i++) {
+        zip_entry_t *e = &entries[i];
+        uint16_t nlen = strlen(e->name);
+        uint8_t cd[46];
+        memset(cd, 0, 46);
+        cd[0] = 0x50; cd[1] = 0x4b; cd[2] = 0x01; cd[3] = 0x02;
+        cd[4] = 20; cd[6] = 20;
+        memcpy(cd + 16, &e->crc, 4);
+        memcpy(cd + 20, &e->size, 4);
+        memcpy(cd + 24, &e->size, 4);
+        memcpy(cd + 28, &nlen, 2);
+        memcpy(cd + 42, &e->offset, 4);
+        write(zfd, cd, 46);
+        write(zfd, e->name, nlen);
+        offset += 46 + nlen;
+    }
+    uint32_t cd_size = offset - cd_offset;
+
+    /* End of central directory */
+    uint8_t ecd[22];
+    memset(ecd, 0, 22);
+    ecd[0] = 0x50; ecd[1] = 0x4b; ecd[2] = 0x05; ecd[3] = 0x06;
+    uint16_t cnt16 = (uint16_t)count;
+    memcpy(ecd + 8, &cnt16, 2);
+    memcpy(ecd + 10, &cnt16, 2);
+    memcpy(ecd + 12, &cd_size, 4);
+    memcpy(ecd + 16, &cd_offset, 4);
+    write(zfd, ecd, 22);
+
+    close(zfd);
+    free(entries);
+    printf("[Garlic] Created ZIP %s (%d files)\n", zip_path, count);
+    return 0;
+}
