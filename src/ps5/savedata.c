@@ -13,6 +13,7 @@
 
 #include "savedata.h"
 #include "util.h"
+#include "log.h"
 
 /* ── Globals ───────────────────────────────────────────────────── */
 PprCreateFn g_pprCreate = NULL;
@@ -25,9 +26,9 @@ void savedata_init(void) {
     void *vsh = dlopen("libSceFsInternalForVsh.sprx", RTLD_LAZY);
     if (vsh) {
         g_pprCreate = (PprCreateFn)dlsym(vsh, "sceFsCreatePprPfsSaveDataImage");
-        printf("[Garlic] PprCreate: %s\n", g_pprCreate ? "available" : "not found");
+        garlic_log("[Garlic] PprCreate: %s\n", g_pprCreate ? "available" : "not found");
     } else {
-        printf("[Garlic] Failed to dlopen libSceFsInternalForVsh.sprx\n");
+        garlic_log("[Garlic] Failed to dlopen libSceFsInternalForVsh.sprx\n");
     }
 
     /* Force unmount any stale mounts from previous runs */
@@ -55,9 +56,9 @@ int save_mount(const char *save_path) {
         const char *basename = strrchr(save_path, '/');
         basename = basename ? basename + 1 : save_path;
         snprintf(g_local_copy, sizeof(g_local_copy), "/data/save_files/%s", basename);
-        printf("[Garlic] Copying %s -> %s\n", save_path, g_local_copy);
+        garlic_log("[Garlic] Copying %s -> %s\n", save_path, g_local_copy);
         if (copy_file(save_path, g_local_copy) < 0) {
-            printf("[Garlic] Copy failed (errno %d)\n", errno);
+            garlic_log("[Garlic] Copy failed (errno %d)\n", errno);
             return -1;
         }
         chmod(g_local_copy, 0755);
@@ -73,25 +74,25 @@ int save_mount(const char *save_path) {
 
     int fd = open(mount_src, O_RDONLY);
     if (fd < 0) {
-        printf("[Garlic] Cannot open %s (errno %d)\n", mount_src, errno);
+        garlic_log("[Garlic] Cannot open %s (errno %d)\n", mount_src, errno);
         return -2;
     }
     int ret = pread(fd, pfsbuf.key, 0x60, 0x800);
     close(fd);
     if (ret != 0x60) {
-        printf("[Garlic] Failed to read sealed key (ret=%d)\n", ret);
+        garlic_log("[Garlic] Failed to read sealed key (ret=%d)\n", ret);
         return -3;
     }
 
     int pfsmgr = open("/dev/pfsmgr", 2);
     if (pfsmgr < 0) {
-        printf("[Garlic] Cannot open /dev/pfsmgr\n");
+        garlic_log("[Garlic] Cannot open /dev/pfsmgr\n");
         memset(pfsbuf.hash, 0, sizeof(pfsbuf.hash));
     } else {
         ret = ioctl(pfsmgr, 0xc0845302, &pfsbuf);
         close(pfsmgr);
         if (ret < 0) {
-            printf("[Garlic] ioctl failed (ret=%d), using zeroed key\n", ret);
+            garlic_log("[Garlic] ioctl failed (ret=%d), using zeroed key\n", ret);
             memset(pfsbuf.hash, 0, sizeof(pfsbuf.hash));
         }
     }
@@ -106,11 +107,11 @@ int save_mount(const char *save_path) {
     signal(SIGPIPE, SIG_IGN);
 
     if (ret >= 0) {
-        printf("[Garlic] Mounted %s (handle=%d)\n", mount_src, ret);
+        garlic_log("[Garlic] Mounted %s (handle=%d)\n", mount_src, ret);
         g_mounted = 1;
         return 0;
     }
-    printf("[Garlic] Mount failed (0x%x, errno=%d)\n", ret, errno);
+    garlic_log("[Garlic] Mount failed (0x%x, errno=%d)\n", ret, errno);
     return ret;
 }
 
@@ -142,13 +143,13 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
     /* Create file and allocate space */
     int fd = open(image_path, O_CREAT | O_TRUNC | O_RDWR, 0777);
     if (fd < 0) {
-        printf("[Garlic] Cannot create image %s (errno %d)\n", image_path, errno);
+        garlic_log("[Garlic] Cannot create image %s (errno %d)\n", image_path, errno);
         return -1;
     }
 
     int ret = sceFsUfsAllocateSaveData(fd, img_size, 0, 0);
     if (ret < 0) {
-        printf("[Garlic] UfsAllocate failed (0x%x), using ftruncate\n", ret);
+        garlic_log("[Garlic] UfsAllocate failed (0x%x), using ftruncate\n", ret);
         if (ftruncate(fd, img_size) < 0) {
             close(fd);
             unlink(image_path);
@@ -156,11 +157,11 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
         }
     }
     close(fd);
-    printf("[Garlic] Created image %llu bytes\n", (unsigned long long)img_size);
+    garlic_log("[Garlic] Created image %llu bytes\n", (unsigned long long)img_size);
 
     /* Format as PFS with compression */
     if (!g_pprCreate) {
-        printf("[Garlic] PprCreate not available\n");
+        garlic_log("[Garlic] PprCreate not available\n");
         unlink(image_path);
         return -3;
     }
@@ -173,12 +174,12 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
 
     ret = g_pprCreate(&copt, image_path, 0, img_size, ckey);
     if (ret < 0) {
-        printf("[Garlic] PprCreate failed (0x%x)\n", ret);
+        garlic_log("[Garlic] PprCreate failed (0x%x)\n", ret);
         unlink(image_path);
         return -4;
     }
 
-    printf("[Garlic] Formatted PFS image OK\n");
+    garlic_log("[Garlic] Formatted PFS image OK\n");
     return 0;
 }
 
@@ -200,12 +201,12 @@ int save_mount_new(const char *image_path) {
     signal(SIGPIPE, SIG_IGN);
 
     if (ret >= 0) {
-        printf("[Garlic] Mounted new PFS (handle=%d)\n", ret);
+        garlic_log("[Garlic] Mounted new PFS (handle=%d)\n", ret);
         g_mounted = 1;
         g_local_copy[0] = 0;
         return 0;
     }
-    printf("[Garlic] Mount new PFS failed (0x%x)\n", ret);
+    garlic_log("[Garlic] Mount new PFS failed (0x%x)\n", ret);
     return ret;
 }
 
