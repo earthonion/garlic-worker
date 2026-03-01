@@ -114,7 +114,7 @@ int save_mount(const char *save_path) {
         garlic_log("[Garlic] Corrupted save! pfsSKKey at 0x%x instead of 0x800. "
                    "Is your FTP server set to transfer in binary mode?\n", 0x800 + key_off);
         free(pfsbuf);
-        return -3;
+        return SAVE_ERR_CORRUPTED;
     }
     memcpy(pfsbuf->key, keybuf, 0x60);
 

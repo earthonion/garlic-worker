@@ -25,6 +25,9 @@ int sceFsUfsAllocateSaveData(int fd, uint64_t size, uint64_t flags, int ext);
 /* ── Mount point ───────────────────────────────────────────────── */
 #define GARLIC_MOUNT_POINT "/data/garlic_mnt"
 
+/* ── Error codes ───────────────────────────────────────────────── */
+#define SAVE_ERR_CORRUPTED  (-100)  /* Save file corrupted (e.g. FTP ASCII mode) */
+
 /* ── Public API ────────────────────────────────────────────────── */
 
 /* Initialize savedata subsystem: dlopen + dlsym for PprCreate, force unmount stale mounts */

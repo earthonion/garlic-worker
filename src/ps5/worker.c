@@ -186,8 +186,12 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        if (save_mount(data_path) < 0) {
-            worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
+        int mret = save_mount(data_path);
+        if (mret < 0) {
+            if (mret == SAVE_ERR_CORRUPTED)
+                worker_log(cfg, job_id, "ERROR", "Corrupted save! Is your FTP server set to binary mode?");
+            else
+                worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
             continue;
         }
@@ -380,8 +384,12 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        if (save_mount(data_path) < 0) {
-            worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
+        int mret = save_mount(data_path);
+        if (mret < 0) {
+            if (mret == SAVE_ERR_CORRUPTED)
+                worker_log(cfg, job_id, "ERROR", "Corrupted save! Is your FTP server set to binary mode?");
+            else
+                worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
             continue;
         }
@@ -487,7 +495,10 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
     snprintf(data_path, sizeof(data_path), "/data/save_files/_sample_%s", sb);
     copy_file(sample_saves[0], data_path);
 
-    if (save_mount(data_path) == 0) {
+    int mret = save_mount(data_path);
+    if (mret == SAVE_ERR_CORRUPTED)
+        worker_log(cfg, job_id, "ERROR", "Corrupted save! Is your FTP server set to binary mode?");
+    if (mret == 0) {
         char ks_path[MAX_PATH_LEN];
         snprintf(ks_path, sizeof(ks_path), "%s/sce_sys/keystone", save_get_mount_point());
         int ks_fd = open(ks_path, O_RDONLY);
@@ -535,8 +546,12 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        if (save_mount(data_path) < 0) {
-            worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
+        int mret = save_mount(data_path);
+        if (mret < 0) {
+            if (mret == SAVE_ERR_CORRUPTED)
+                worker_log(cfg, job_id, "ERROR", "Corrupted save! Is your FTP server set to binary mode?");
+            else
+                worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
             continue;
         }
