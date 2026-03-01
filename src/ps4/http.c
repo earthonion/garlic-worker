@@ -12,6 +12,59 @@
 #include "http.h"
 #include "json.h"
 #include "util.h"
+#include "log.h"
+#include <ctype.h>
+
+/* PS4 libc doesn't have strcasestr */
+static const char *my_strcasestr(const char *haystack, const char *needle) {
+    if (!needle[0]) return haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack, *n = needle;
+        while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+            h++; n++;
+        }
+        if (!*n) return haystack;
+    }
+    return NULL;
+}
+
+/* ── PS4 DNS resolution via SceNet ────────────────────────────── */
+
+int sceNetInit(void);
+int sceNetPoolCreate(const char *name, int size, int flags);
+int sceNetResolverCreate(const char *name, int poolid, int flags);
+int sceNetResolverStartNtoa(int rid, const char *hostname,
+                             struct in_addr *addr, int timeout,
+                             int retries, int flags);
+int sceNetResolverDestroy(int rid);
+
+static int g_net_pool = -1;
+
+static void net_init_once(void) {
+    if (g_net_pool >= 0) return;
+    sceNetInit();
+    g_net_pool = sceNetPoolCreate("garlic", 16 * 1024, 0);
+}
+
+static in_addr_t resolve_host(const char *host) {
+    /* Try as IP address first */
+    in_addr_t ip = inet_addr(host);
+    if (ip != INADDR_NONE) return ip;
+
+    /* DNS resolution */
+    net_init_once();
+    if (g_net_pool < 0) return INADDR_NONE;
+
+    int rid = sceNetResolverCreate("res", g_net_pool, 0);
+    if (rid < 0) return INADDR_NONE;
+
+    struct in_addr resolved;
+    int ret = sceNetResolverStartNtoa(rid, host, &resolved, 5000000, 3, 0);
+    sceNetResolverDestroy(rid);
+
+    if (ret < 0) return INADDR_NONE;
+    return resolved.s_addr;
+}
 
 /* ── Internal helpers ──────────────────────────────────────────── */
 
@@ -24,11 +77,17 @@ static int tcp_connect(const char *host, int port) {
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    in_addr_t ip = resolve_host(host);
+    if (ip == INADDR_NONE) {
+        close(sock);
+        return -1;
+    }
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr(host);
+    addr.sin_addr.s_addr = ip;
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(sock);
@@ -76,7 +135,7 @@ static int parse_status(const char *header) {
 }
 
 static int parse_content_length(const char *header) {
-    const char *p = strcasestr(header, "Content-Length:");
+    const char *p = my_strcasestr(header, "Content-Length:");
     if (!p) return -1;
     return atoi(p + 15);
 }
@@ -306,14 +365,14 @@ int http_upload_file_chunked(const char *host, int port,
     if (http_post_json(host, port, init_path, init_body, worker_key, &resp) < 0 ||
         resp.status != 200) {
         close(fd);
-        printf("[Garlic] Chunk init failed (status=%d)\n", resp.status);
+        garlic_log("[Garlic] Chunk init failed (status=%d)\n", resp.status);
         return -1;
     }
 
     char upload_id[128];
     if (json_get_string(resp.body, "upload_id", upload_id, sizeof(upload_id)) < 0) {
         close(fd);
-        printf("[Garlic] No upload_id in init response\n");
+        garlic_log("[Garlic] No upload_id in init response\n");
         return -1;
     }
 
@@ -339,7 +398,7 @@ int http_upload_file_chunked(const char *host, int port,
             total_read += n;
         }
         if (total_read != chunk_len) {
-            printf("[Garlic] Short read on chunk %d\n", i);
+            garlic_log("[Garlic] Short read on chunk %d\n", i);
             free(chunk_buf);
             close(fd);
             return -1;
@@ -357,18 +416,18 @@ int http_upload_file_chunked(const char *host, int port,
                 success = 1;
                 break;
             }
-            printf("[Garlic] Chunk %d/%d attempt %d failed, retrying...\n",
+            garlic_log("[Garlic] Chunk %d/%d attempt %d failed, retrying...\n",
                    i + 1, total_chunks, attempt + 1);
             sleep(1 << attempt);
         }
 
         if (!success) {
-            printf("[Garlic] Chunk %d/%d failed after 3 attempts\n", i + 1, total_chunks);
+            garlic_log("[Garlic] Chunk %d/%d failed after 3 attempts\n", i + 1, total_chunks);
             free(chunk_buf);
             close(fd);
             return -1;
         }
-        printf("[Garlic] Chunk %d/%d uploaded (%d bytes)\n", i + 1, total_chunks, chunk_len);
+        garlic_log("[Garlic] Chunk %d/%d uploaded (%d bytes)\n", i + 1, total_chunks, chunk_len);
     }
 
     free(chunk_buf);
@@ -383,11 +442,11 @@ int http_upload_file_chunked(const char *host, int port,
 
     if (http_post_json(host, port, complete_path, complete_body, worker_key, &resp) < 0 ||
         resp.status != 200) {
-        printf("[Garlic] Chunk complete failed (status=%d)\n", resp.status);
+        garlic_log("[Garlic] Chunk complete failed (status=%d)\n", resp.status);
         return -1;
     }
 
-    printf("[Garlic] Chunked upload complete (%lld bytes, %d chunks)\n",
+    garlic_log("[Garlic] Chunked upload complete (%lld bytes, %d chunks)\n",
            (long long)file_size, total_chunks);
     return 0;
 }

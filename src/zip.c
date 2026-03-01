@@ -8,6 +8,7 @@
 
 #include "zip.h"
 #include "util.h"
+#include "log.h"
 
 /* ── CRC32 ─────────────────────────────────────────────────────── */
 static uint32_t crc_tab[256];
@@ -74,7 +75,7 @@ int zip_extract_file(const char *zip_path, const char *dest_dir) {
         off += 30 + name_len + extra_len;
 
         if (compression != 0) {
-            printf("[Garlic] Skipping compressed entry: %s\n", name);
+            garlic_log("[Garlic] Skipping compressed entry: %s\n", name);
             off += comp_size;
             continue;
         }
@@ -110,7 +111,7 @@ int zip_extract_file(const char *zip_path, const char *dest_dir) {
     }
 
     free(data);
-    printf("[Garlic] Extracted %d files from %s\n", count, zip_path);
+    garlic_log("[Garlic] Extracted %d files from %s\n", count, zip_path);
     return count;
 }
 
@@ -256,6 +257,6 @@ int zip_create_from_dir(const char *src_dir, const char *zip_path) {
 
     close(zfd);
     free(entries);
-    printf("[Garlic] Created ZIP %s (%d files)\n", zip_path, count);
+    garlic_log("[Garlic] Created ZIP %s (%d files)\n", zip_path, count);
     return 0;
 }

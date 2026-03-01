@@ -13,9 +13,10 @@
 #include "zip.h"
 #include "savedata.h"
 #include "util.h"
+#include "log.h"
 
 #define WORK_BASE      "/data/garlic/work"
-#define SFO_AID_OFFSET 0x1B8   /* PS5 account ID offset in param.sfo */
+#define SFO_AID_OFFSET 0x15C   /* PS4 account ID offset in param.sfo */
 #define KEYSTONE_SIZE  0x400
 
 /* ── Worker API helpers ────────────────────────────────────────── */
@@ -63,7 +64,7 @@ static int worker_download_files(worker_config_t *cfg, const char *job_id,
     int status = http_download_to_file(cfg->server_host, cfg->server_port,
                                        url, cfg->worker_key, zip_path);
     if (status != 200) {
-        printf("[Garlic] Download files failed (status=%d)\n", status);
+        garlic_log("[Garlic] Download files failed (status=%d)\n", status);
         return -1;
     }
 
@@ -73,11 +74,11 @@ static int worker_download_files(worker_config_t *cfg, const char *job_id,
 
     int count = zip_extract_file(zip_path, files_dir);
     if (count <= 0) {
-        printf("[Garlic] No files extracted from ZIP\n");
+        garlic_log("[Garlic] No files extracted from ZIP\n");
         return -1;
     }
 
-    printf("[Garlic] Downloaded and extracted %d files\n", count);
+    garlic_log("[Garlic] Downloaded and extracted %d files\n", count);
     return 0;
 }
 
@@ -121,7 +122,9 @@ static int copy_mounted_to_result(const char *result_dir, const char *save_name,
 }
 
 /* ── Find save files in extracted directory ────────────────────── */
-/* PS5 saves are single files (no .bin companion). Returns count. */
+/* PS4 saves come in pairs: SAVENAME + SAVENAME.bin
+ * Skip .bin files — they are sealed key companions, not saves.
+ * Returns count of non-.bin regular files. */
 static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max) {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -129,6 +132,9 @@ static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max)
     struct dirent *ent;
     while ((ent = readdir(d)) && count < max) {
         if (ent->d_name[0] == '.') continue;
+        /* Skip .bin sealed key companions */
+        int len = strlen(ent->d_name);
+        if (len > 4 && strcmp(ent->d_name + len - 4, ".bin") == 0) continue;
         char path[MAX_PATH_LEN];
         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
         struct stat st;
@@ -160,7 +166,7 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
     snprintf(result_dir, sizeof(result_dir), "%s/result", work_dir);
     mkdir(result_dir, 0777);
 
-    /* Find save files */
+    /* Find save files (skips .bin companions) */
     char saves[64][MAX_PATH_LEN];
     int save_count = find_save_files(files_dir, saves, 64);
     if (save_count == 0) {
@@ -177,7 +183,7 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
         worker_logf(cfg, job_id, "INFO", "Decrypting %s (%d/%d)...",
                     basename, i + 1, save_count);
 
-        /* Copy to /data/ for mount */
+        /* Copy save + .bin to /data/ for mount */
         char data_path[MAX_PATH_LEN];
         snprintf(data_path, sizeof(data_path), "/data/save_files/_work_%s", basename);
         if (copy_file(save_path, data_path) < 0) {
@@ -185,15 +191,23 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
+        /* Copy .bin companion */
+        char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+        snprintf(bin_src, sizeof(bin_src), "%s.bin", save_path);
+        snprintf(bin_dst, sizeof(bin_dst), "%s.bin", data_path);
+        copy_file(bin_src, bin_dst); /* may fail if no .bin — save_mount handles it */
+
         if (save_mount(data_path) < 0) {
             worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
+            unlink(bin_dst);
             continue;
         }
 
         copy_mounted_to_result(result_dir, basename, include_sce_sys);
         save_unmount();
         unlink(data_path);
+        unlink(bin_dst);
         processed++;
     }
 
@@ -246,7 +260,6 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     if (saveblocks > 0) {
         data_size = (uint64_t)saveblocks * 32768;
     } else {
-        /* Estimate from file sizes */
         DIR *d = opendir(files_dir);
         if (d) {
             struct dirent *ent;
@@ -303,7 +316,8 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     save_unmount();
 
-    /* Copy result to result dir and zip */
+    /* Copy result to result dir and zip.
+     * For PS4, encrypt produces both the save file and a .bin sealed key. */
     char result_dir[MAX_PATH_LEN];
     snprintf(result_dir, sizeof(result_dir), "%s/result", work_dir);
     mkdir(result_dir, 0777);
@@ -312,6 +326,13 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, savename);
     copy_file(img_path, result_save);
     unlink(img_path);
+
+    /* Copy .bin sealed key companion if it exists */
+    char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+    snprintf(bin_src, sizeof(bin_src), "%s.bin", img_path);
+    snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", result_dir, savename);
+    copy_file(bin_src, bin_dst);
+    unlink(bin_src);
 
     worker_log(cfg, job_id, "INFO", "Uploading result...");
     char result_zip[MAX_PATH_LEN];
@@ -379,9 +400,16 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
+        /* Copy .bin companion */
+        char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+        snprintf(bin_src, sizeof(bin_src), "%s.bin", save_path);
+        snprintf(bin_dst, sizeof(bin_dst), "%s.bin", data_path);
+        copy_file(bin_src, bin_dst);
+
         if (save_mount(data_path) < 0) {
             worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
+            unlink(bin_dst);
             continue;
         }
 
@@ -400,11 +428,15 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
 
         save_unmount();
 
-        /* Copy resigned save to result */
+        /* Copy resigned save + .bin to result */
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
         copy_file(data_path, result_save);
+        char result_bin[MAX_PATH_LEN];
+        snprintf(result_bin, sizeof(result_bin), "%s/%s.bin", result_dir, basename);
+        copy_file(bin_dst, result_bin);
         unlink(data_path);
+        unlink(bin_dst);
         processed++;
     }
 
@@ -486,6 +518,12 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
     snprintf(data_path, sizeof(data_path), "/data/save_files/_sample_%s", sb);
     copy_file(sample_saves[0], data_path);
 
+    /* Copy .bin companion for sample */
+    char sample_bin_src[MAX_PATH_LEN], sample_bin_dst[MAX_PATH_LEN];
+    snprintf(sample_bin_src, sizeof(sample_bin_src), "%s.bin", sample_saves[0]);
+    snprintf(sample_bin_dst, sizeof(sample_bin_dst), "%s.bin", data_path);
+    copy_file(sample_bin_src, sample_bin_dst);
+
     if (save_mount(data_path) == 0) {
         char ks_path[MAX_PATH_LEN];
         snprintf(ks_path, sizeof(ks_path), "%s/sce_sys/keystone", save_get_mount_point());
@@ -501,6 +539,7 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
         save_unmount();
     }
     unlink(data_path);
+    unlink(sample_bin_dst);
 
     if (!have_keystone) {
         worker_log(cfg, job_id, "ERROR", "Failed to extract keystone from sample");
@@ -534,9 +573,16 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
+        /* Copy .bin companion */
+        char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+        snprintf(bin_src, sizeof(bin_src), "%s.bin", save_path);
+        snprintf(bin_dst, sizeof(bin_dst), "%s.bin", data_path);
+        copy_file(bin_src, bin_dst);
+
         if (save_mount(data_path) < 0) {
             worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
+            unlink(bin_dst);
             continue;
         }
 
@@ -563,10 +609,15 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
 
         save_unmount();
 
+        /* Copy result save + .bin */
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
         copy_file(data_path, result_save);
+        char result_bin[MAX_PATH_LEN];
+        snprintf(result_bin, sizeof(result_bin), "%s/%s.bin", result_dir, basename);
+        copy_file(bin_dst, result_bin);
         unlink(data_path);
+        unlink(bin_dst);
         processed++;
     }
 
@@ -593,8 +644,9 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
 
 static int process_keyset(worker_config_t *cfg, const char *job_id,
                           const char *params, const char *work_dir) {
-    /* PS5 does not use sealed keys or keysets — return a fixed response */
-    worker_log(cfg, job_id, "INFO", "PS5 uses zeroed keys, no keyset check needed");
+    worker_log(cfg, job_id, "INFO", "Checking PS4 keyset...");
+
+    int max_keyset = save_get_max_keyset();
 
     char result_dir[MAX_PATH_LEN];
     snprintf(result_dir, sizeof(result_dir), "%s/result", work_dir);
@@ -604,8 +656,9 @@ static int process_keyset(worker_config_t *cfg, const char *job_id,
     snprintf(json_path, sizeof(json_path), "%s/keyset.json", result_dir);
     int fd = open(json_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd >= 0) {
-        const char *json = "{\"platform\":\"ps5\",\"maxKeyset\":0,"
-                           "\"note\":\"PS5 uses zeroed keys, no keyset check needed\"}";
+        char json[256];
+        snprintf(json, sizeof(json),
+                 "{\"platform\":\"ps4\",\"maxKeyset\":%d}", max_keyset);
         write(fd, json, strlen(json));
         close(fd);
     }
@@ -621,6 +674,7 @@ static int process_keyset(worker_config_t *cfg, const char *job_id,
         return -1;
     }
 
+    worker_logf(cfg, job_id, "INFO", "Max keyset: %d", max_keyset);
     return 0;
 }
 
@@ -629,27 +683,26 @@ static int process_keyset(worker_config_t *cfg, const char *job_id,
 void worker_loop(worker_config_t *cfg) {
     mkdir_p(WORK_BASE);
 
-    printf("[Garlic] Worker loop started (poll every %ds)\n", cfg->poll_interval);
+    garlic_log("[Garlic] Worker loop started (poll every %ds)\n", cfg->poll_interval);
 
     while (1) {
         http_response_t resp;
         int rc = http_get(cfg->server_host, cfg->server_port,
-                          "/api/worker/next?platform=ps5", cfg->worker_key, &resp);
+                          "/api/worker/next?platform=ps4", cfg->worker_key, &resp);
 
         if (rc < 0) {
-            printf("[Garlic] Server unreachable, retrying in %ds\n", cfg->poll_interval);
+            garlic_log("[Garlic] Server unreachable, retrying in %ds\n", cfg->poll_interval);
             sleep(cfg->poll_interval);
             continue;
         }
 
         if (resp.status == 204) {
-            /* No jobs available */
             sleep(cfg->poll_interval);
             continue;
         }
 
         if (resp.status != 200) {
-            printf("[Garlic] Unexpected status %d from /next\n", resp.status);
+            garlic_log("[Garlic] Unexpected status %d from /next\n", resp.status);
             sleep(cfg->poll_interval);
             continue;
         }
@@ -661,12 +714,12 @@ void worker_loop(worker_config_t *cfg) {
         json_get_object(resp.body, "params", params, sizeof(params));
 
         if (!job_id[0] || !operation[0]) {
-            printf("[Garlic] Invalid job response\n");
+            garlic_log("[Garlic] Invalid job response\n");
             sleep(cfg->poll_interval);
             continue;
         }
 
-        printf("[Garlic] Job %s: %s\n", job_id, operation);
+        garlic_log("[Garlic] Job %s: %s\n", job_id, operation);
 
         /* Set status running */
         worker_set_status(cfg, job_id, "running", NULL);
@@ -696,7 +749,6 @@ void worker_loop(worker_config_t *cfg) {
         if (result == 0)
             worker_set_status(cfg, job_id, "done", NULL);
         else if (result < 0)
-            /* Status may already be set to failed by the processor */
             worker_set_status(cfg, job_id, "failed", NULL);
 
         /* Force unmount if still mounted */
@@ -706,7 +758,7 @@ void worker_loop(worker_config_t *cfg) {
         /* Cleanup work directory */
         delete_recursive(work_dir);
 
-        printf("[Garlic] Job %s complete (result=%d)\n", job_id, result);
-        sleep(2); /* Brief pause before next poll */
+        garlic_log("[Garlic] Job %s complete (result=%d)\n", job_id, result);
+        sleep(2);
     }
 }
