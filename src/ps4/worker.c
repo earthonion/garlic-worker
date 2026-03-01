@@ -275,8 +275,11 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         if (data_size < 32 * 1024 * 1024) data_size = 32 * 1024 * 1024;
     }
 
+    garlic_log("[Garlic] Encrypt: data_size=%llu savename=%s\n",
+               (unsigned long long)data_size, savename);
     worker_logf(cfg, job_id, "INFO", "Creating PFS image (%llu bytes)...",
                 (unsigned long long)data_size);
+    garlic_log("[Garlic] Encrypt: calling save_create_pfs\n");
 
     char img_path[MAX_PATH_LEN];
     snprintf(img_path, sizeof(img_path), "/data/save_files/_work_%s", savename);
@@ -390,12 +393,15 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
         const char *basename = strrchr(save_path, '/');
         basename = basename ? basename + 1 : save_path;
 
+        garlic_log("[Garlic] Resign: processing %s (%d/%d)\n", basename, i + 1, save_count);
         worker_logf(cfg, job_id, "INFO", "Resigning %s (%d/%d)...",
                     basename, i + 1, save_count);
 
         char data_path[MAX_PATH_LEN];
         snprintf(data_path, sizeof(data_path), "/data/save_files/_work_%s", basename);
+        garlic_log("[Garlic] Resign: copying save to %s\n", data_path);
         if (copy_file(save_path, data_path) < 0) {
+            garlic_log("[Garlic] Resign: copy failed for %s\n", basename);
             worker_logf(cfg, job_id, "WARNING", "Failed to copy %s", basename);
             continue;
         }
@@ -404,9 +410,14 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
         char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
         snprintf(bin_src, sizeof(bin_src), "%s.bin", save_path);
         snprintf(bin_dst, sizeof(bin_dst), "%s.bin", data_path);
-        copy_file(bin_src, bin_dst);
+        int bin_ok = copy_file(bin_src, bin_dst);
+        garlic_log("[Garlic] Resign: .bin copy %s (src=%s)\n",
+                   bin_ok == 0 ? "OK" : "FAILED", bin_src);
 
-        if (save_mount(data_path) < 0) {
+        garlic_log("[Garlic] Resign: calling save_mount(%s)\n", data_path);
+        int mount_ret = save_mount(data_path);
+        garlic_log("[Garlic] Resign: save_mount returned %d\n", mount_ret);
+        if (mount_ret < 0) {
             worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
             unlink(data_path);
             unlink(bin_dst);

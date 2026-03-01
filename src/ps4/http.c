@@ -28,42 +28,28 @@ static const char *my_strcasestr(const char *haystack, const char *needle) {
     return NULL;
 }
 
-/* ── PS4 DNS resolution via SceNet ────────────────────────────── */
+/* ── DNS resolution via getaddrinfo (no sceNetInit needed) ─────── */
 
-int sceNetInit(void);
-int sceNetPoolCreate(const char *name, int size, int flags);
-int sceNetResolverCreate(const char *name, int poolid, int flags);
-int sceNetResolverStartNtoa(int rid, const char *hostname,
-                             struct in_addr *addr, int timeout,
-                             int retries, int flags);
-int sceNetResolverDestroy(int rid);
-
-static int g_net_pool = -1;
-
-static void net_init_once(void) {
-    if (g_net_pool >= 0) return;
-    sceNetInit();
-    g_net_pool = sceNetPoolCreate("garlic", 16 * 1024, 0);
-}
+#include <netdb.h>
 
 static in_addr_t resolve_host(const char *host) {
     /* Try as IP address first */
     in_addr_t ip = inet_addr(host);
     if (ip != INADDR_NONE) return ip;
 
-    /* DNS resolution */
-    net_init_once();
-    if (g_net_pool < 0) return INADDR_NONE;
+    /* DNS resolution via POSIX getaddrinfo */
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
-    int rid = sceNetResolverCreate("res", g_net_pool, 0);
-    if (rid < 0) return INADDR_NONE;
+    int err = getaddrinfo(host, NULL, &hints, &res);
+    if (err != 0 || !res) return INADDR_NONE;
 
-    struct in_addr resolved;
-    int ret = sceNetResolverStartNtoa(rid, host, &resolved, 5000000, 3, 0);
-    sceNetResolverDestroy(rid);
-
-    if (ret < 0) return INADDR_NONE;
-    return resolved.s_addr;
+    struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+    in_addr_t result = addr->sin_addr.s_addr;
+    freeaddrinfo(res);
+    return result;
 }
 
 /* ── Internal helpers ──────────────────────────────────────────── */

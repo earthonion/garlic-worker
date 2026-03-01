@@ -19,7 +19,7 @@ PS4_CC      := $(PS4_PAYLOAD_SDK)/bin/orbis-clang
 PS4_CFLAGS  := -O2 -Wall -std=gnu11 -Isrc -Isrc/ps4 \
                -I$(PS4_PAYLOAD_SDK)/target/include -DWORKER_KEY=\"$(WORKER_KEY)\"
 PS4_LDFLAGS := -L$(PS4_PAYLOAD_SDK)/target/lib
-PS4_LIBS    := -lkernel -lSceSystemService -lSceUserService -lSceNet
+PS4_LIBS    := -lkernel -lSceSystemService -lSceUserService
 PS4_SRCS    := src/ps4/main.c src/ps4/http.c src/ps4/worker.c src/ps4/savedata.c
 
 # Default: build both
