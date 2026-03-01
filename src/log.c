@@ -16,6 +16,10 @@ void log_init(void) {
         printf("[Garlic] Warning: could not open log file %s\n", LOG_PATH);
 }
 
+void log_flush(void) {
+    if (g_log_fd >= 0) fsync(g_log_fd);
+}
+
 void garlic_log(const char *fmt, ...) {
     char buf[4096];
     va_list a;
