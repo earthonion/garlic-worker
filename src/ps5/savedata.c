@@ -65,7 +65,7 @@ int save_mount(const char *save_path) {
         mount_src = g_local_copy;
     }
 
-    /* Read sealed key at 0x800 and decrypt via pfsmgr */
+    /* Find and read sealed key (search for pfsSKKey magic near 0x800) */
     /* Heap-allocate ioctl buffer — ioctl may corrupt stack beyond buffer bounds */
     struct {
         uint8_t key[0x60];
@@ -75,19 +75,48 @@ int save_mount(const char *save_path) {
     if (!pfsbuf) return -2;
     memset(pfsbuf, 0, sizeof(*pfsbuf));
 
+    garlic_log("[Garlic] Opening %s for sealed key read\n", mount_src);
     int fd = open(mount_src, O_RDONLY);
     if (fd < 0) {
         garlic_log("[Garlic] Cannot open %s (errno %d)\n", mount_src, errno);
         free(pfsbuf);
         return -2;
     }
-    int ret = pread(fd, pfsbuf->key, 0x60, 0x800);
+    struct stat st;
+    fstat(fd, &st);
+    garlic_log("[Garlic] File size: %lld\n", (long long)st.st_size);
+
+    /* Read wider region and search for pfsSKKey magic */
+    uint8_t keybuf[0x80];
+    int ret = pread(fd, keybuf, sizeof(keybuf), 0x800);
     close(fd);
-    if (ret != 0x60) {
-        garlic_log("[Garlic] Failed to read sealed key (ret=%d)\n", ret);
+    if (ret < 0x60) {
+        garlic_log("[Garlic] Failed to read key region (ret=%d)\n", ret);
         free(pfsbuf);
         return -3;
     }
+
+    /* Find pfsSKKey magic (8 bytes: 70 66 73 53 4b 4b 65 79) */
+    static const uint8_t magic[] = {'p','f','s','S','K','K','e','y'};
+    int key_off = -1;
+    for (int i = 0; i <= ret - 0x60; i++) {
+        if (memcmp(keybuf + i, magic, 8) == 0) {
+            key_off = i;
+            break;
+        }
+    }
+    if (key_off < 0) {
+        garlic_log("[Garlic] pfsSKKey magic not found — save file is corrupted\n");
+        free(pfsbuf);
+        return -3;
+    }
+    if (key_off != 0) {
+        garlic_log("[Garlic] Corrupted save! pfsSKKey at 0x%x instead of 0x800. "
+                   "Is your FTP server set to transfer in binary mode?\n", 0x800 + key_off);
+        free(pfsbuf);
+        return -3;
+    }
+    memcpy(pfsbuf->key, keybuf, 0x60);
 
     int pfsmgr = open("/dev/pfsmgr", 2);
     if (pfsmgr < 0) {
@@ -99,7 +128,20 @@ int save_mount(const char *save_path) {
         if (ret < 0) {
             garlic_log("[Garlic] ioctl failed (ret=%d), using zeroed key\n", ret);
             memset(pfsbuf->hash, 0, sizeof(pfsbuf->hash));
+        } else {
+            garlic_log("[Garlic] ioctl OK (ret=%d)\n", ret);
         }
+    }
+
+    struct stat mnt_st;
+    if (stat(GARLIC_MOUNT_POINT, &mnt_st) < 0) {
+        garlic_log("[Garlic] Mount point %s missing, creating\n", GARLIC_MOUNT_POINT);
+        mkdir(GARLIC_MOUNT_POINT, 0777);
+    }
+
+    struct stat src_st;
+    if (stat(mount_src, &src_st) < 0) {
+        garlic_log("[Garlic] Save file %s gone before mount! errno=%d\n", mount_src, errno);
     }
 
     MountOpt mopt;
@@ -107,9 +149,20 @@ int save_mount(const char *save_path) {
     sceFsInitMountSaveDataOpt(&mopt);
     mopt.budgetid = "system";
 
+    garlic_log("[Garlic] Mounting %s -> %s\n", mount_src, GARLIC_MOUNT_POINT);
     signal(SIGPIPE, SIG_DFL);
     ret = sceFsMountSaveData(&mopt, mount_src, GARLIC_MOUNT_POINT, pfsbuf->hash);
     signal(SIGPIPE, SIG_IGN);
+
+    /* If mount failed with decrypted key, retry with zeroed key
+       (save may be from a different console) */
+    if (ret < 0) {
+        garlic_log("[Garlic] Mount with decrypted key failed (0x%x), retrying with zeroed key\n", ret);
+        uint8_t zkey[0x20] = {0};
+        signal(SIGPIPE, SIG_DFL);
+        ret = sceFsMountSaveData(&mopt, mount_src, GARLIC_MOUNT_POINT, zkey);
+        signal(SIGPIPE, SIG_IGN);
+    }
     free(pfsbuf);
 
     if (ret >= 0) {
