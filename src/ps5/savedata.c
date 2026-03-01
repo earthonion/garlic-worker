@@ -66,34 +66,39 @@ int save_mount(const char *save_path) {
     }
 
     /* Read sealed key at 0x800 and decrypt via pfsmgr */
+    /* Heap-allocate ioctl buffer — ioctl may corrupt stack beyond buffer bounds */
     struct {
         uint8_t key[0x60];
         uint8_t hash[0x20];
         uint32_t result;
-    } pfsbuf;
+    } *pfsbuf = malloc(sizeof(*pfsbuf));
+    if (!pfsbuf) return -2;
+    memset(pfsbuf, 0, sizeof(*pfsbuf));
 
     int fd = open(mount_src, O_RDONLY);
     if (fd < 0) {
         garlic_log("[Garlic] Cannot open %s (errno %d)\n", mount_src, errno);
+        free(pfsbuf);
         return -2;
     }
-    int ret = pread(fd, pfsbuf.key, 0x60, 0x800);
+    int ret = pread(fd, pfsbuf->key, 0x60, 0x800);
     close(fd);
     if (ret != 0x60) {
         garlic_log("[Garlic] Failed to read sealed key (ret=%d)\n", ret);
+        free(pfsbuf);
         return -3;
     }
 
     int pfsmgr = open("/dev/pfsmgr", 2);
     if (pfsmgr < 0) {
         garlic_log("[Garlic] Cannot open /dev/pfsmgr\n");
-        memset(pfsbuf.hash, 0, sizeof(pfsbuf.hash));
+        memset(pfsbuf->hash, 0, sizeof(pfsbuf->hash));
     } else {
-        ret = ioctl(pfsmgr, 0xc0845302, &pfsbuf);
+        ret = ioctl(pfsmgr, 0xc0845302, pfsbuf);
         close(pfsmgr);
         if (ret < 0) {
             garlic_log("[Garlic] ioctl failed (ret=%d), using zeroed key\n", ret);
-            memset(pfsbuf.hash, 0, sizeof(pfsbuf.hash));
+            memset(pfsbuf->hash, 0, sizeof(pfsbuf->hash));
         }
     }
 
@@ -103,8 +108,9 @@ int save_mount(const char *save_path) {
     mopt.budgetid = "system";
 
     signal(SIGPIPE, SIG_DFL);
-    ret = sceFsMountSaveData(&mopt, mount_src, GARLIC_MOUNT_POINT, pfsbuf.hash);
+    ret = sceFsMountSaveData(&mopt, mount_src, GARLIC_MOUNT_POINT, pfsbuf->hash);
     signal(SIGPIPE, SIG_IGN);
+    free(pfsbuf);
 
     if (ret >= 0) {
         garlic_log("[Garlic] Mounted %s (handle=%d)\n", mount_src, ret);

@@ -49,7 +49,8 @@ int main(void) {
     sceUserServiceInitialize(0);
     signal(SIGPIPE, SIG_IGN);
 
-    /* elfldr already provides elevated privileges — no jailbreak needed */
+    /* elfldr gives us kernel r/w — credential elevation for PFS mount
+     * is done in savedata.c before each mount call */
 
     /* Create work directories */
     mkdir("/data/garlic", 0777);
