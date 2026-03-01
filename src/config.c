@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "config.h"
+#include "log.h"
 
 #ifndef WORKER_KEY
 #define WORKER_KEY "changeme"
@@ -13,7 +14,7 @@
 static int config_create_default(const char *path, worker_config_t *cfg) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        printf("[Garlic] Failed to create config at %s\n", path);
+        garlic_log("[Garlic] Failed to create config at %s\n", path);
         return -1;
     }
 
@@ -27,7 +28,7 @@ static int config_create_default(const char *path, worker_config_t *cfg) {
     write(fd, buf, n);
     close(fd);
 
-    printf("[Garlic] Created default config at %s\n", path);
+    garlic_log("[Garlic] Created default config at %s\n", path);
     return 0;
 }
 
@@ -40,7 +41,7 @@ int config_load(const char *path, worker_config_t *cfg) {
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        printf("[Garlic] Config not found at %s, creating default...\n", path);
+        garlic_log("[Garlic] Config not found at %s, creating default...\n", path);
         return config_create_default(path, cfg);
     }
 
@@ -84,7 +85,7 @@ int config_load(const char *path, worker_config_t *cfg) {
         line = nl ? nl + 1 : NULL;
     }
 
-    printf("[Garlic] Config: host=%s port=%d key=%s poll=%ds\n",
+    garlic_log("[Garlic] Config: host=%s port=%d key=%s poll=%ds\n",
            cfg->server_host, cfg->server_port,
            cfg->worker_key[0] ? "(set)" : "(empty)",
            cfg->poll_interval);
