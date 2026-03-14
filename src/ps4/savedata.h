@@ -42,4 +42,7 @@ const char *save_get_mount_point(void);
 /* Get max keyset this console can decrypt */
 int save_get_max_keyset(void);
 
+/* Periodic cleanup: force unmount, delete temp files in /data/save_files/ */
+void save_periodic_cleanup(void);
+
 #endif

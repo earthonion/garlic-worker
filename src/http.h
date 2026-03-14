@@ -35,4 +35,7 @@ int http_upload_file_chunked(const char *host, int port,
                              const char *base_path, const char *src_path,
                              const char *worker_key);
 
+/* Destroy and recreate DNS resolver pool to prevent fragmentation */
+void http_reset_pool(void);
+
 #endif

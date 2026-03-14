@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -423,6 +424,34 @@ int save_mount_new(const char *image_path) {
 
 int save_is_mounted(void) { return g_mounted; }
 const char *save_get_mount_point(void) { return GARLIC_MOUNT_POINT; }
+
+void save_periodic_cleanup(void) {
+    /* Force unmount in case kernel state is stale */
+    if (g_mounted) save_unmount();
+
+    if (fn_InitUmountOpt && fn_UmountSaveData) {
+        uint8_t u0_buf[256];
+        memset(u0_buf, 0, sizeof(u0_buf));
+        fn_InitUmountOpt((UmountOpt *)u0_buf);
+        fn_UmountSaveData((UmountOpt *)u0_buf, GARLIC_MOUNT_POINT, 0, 0);
+    }
+    g_mounted = 0;
+
+    /* Clean up any leftover temp files in /data/save_files/ */
+    DIR *d = opendir("/data/save_files");
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d))) {
+            if (ent->d_name[0] == '.') continue;
+            char fp[MAX_PATH_LEN];
+            snprintf(fp, sizeof(fp), "/data/save_files/%s", ent->d_name);
+            unlink(fp);
+        }
+        closedir(d);
+    }
+
+    garlic_log("[Garlic] Periodic cleanup done\n");
+}
 
 int save_get_max_keyset(void) {
     if (g_max_keyset >= 0) return g_max_keyset;
