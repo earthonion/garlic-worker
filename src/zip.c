@@ -176,34 +176,37 @@ int zip_create_from_dir(const char *src_dir, const char *zip_path) {
         return -1;
     }
 
+    uint8_t buf[65536];
     uint32_t offset = 0;
+
     for (int i = 0; i < count; i++) {
         zip_entry_t *e = &entries[i];
         e->offset = offset;
         uint16_t nlen = strlen(e->name);
 
-        /* Read file data and compute CRC */
         char fullpath[MAX_PATH_LEN];
         snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->name);
+
+        /* First pass: compute CRC by streaming */
+        uint32_t crc = 0xFFFFFFFF;
         int fd = open(fullpath, O_RDONLY);
-        uint8_t *fdata = NULL;
         if (fd >= 0 && e->size > 0) {
-            fdata = malloc(e->size);
-            if (fdata) {
-                size_t total = 0;
-                while (total < e->size) {
-                    ssize_t r = read(fd, fdata + total, e->size - total);
-                    if (r <= 0) break;
-                    total += r;
-                }
+            size_t remaining = e->size;
+            while (remaining > 0) {
+                size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                ssize_t r = read(fd, buf, chunk);
+                if (r <= 0) break;
+                for (ssize_t j = 0; j < r; j++)
+                    crc = crc_tab[(crc ^ buf[j]) & 0xFF] ^ (crc >> 8);
+                remaining -= r;
             }
             close(fd);
         } else if (fd >= 0) {
             close(fd);
         }
-        e->crc = fdata ? calc_crc(fdata, e->size) : 0;
+        e->crc = (e->size > 0) ? (crc ^ 0xFFFFFFFF) : 0;
 
-        /* Local file header */
+        /* Write local file header */
         uint8_t lh[30];
         memset(lh, 0, 30);
         lh[0] = 0x50; lh[1] = 0x4b; lh[2] = 0x03; lh[3] = 0x04;
@@ -214,9 +217,21 @@ int zip_create_from_dir(const char *src_dir, const char *zip_path) {
         memcpy(lh + 26, &nlen, 2);
         write(zfd, lh, 30);
         write(zfd, e->name, nlen);
-        if (fdata) {
-            write(zfd, fdata, e->size);
-            free(fdata);
+
+        /* Second pass: stream file data to zip */
+        fd = open(fullpath, O_RDONLY);
+        if (fd >= 0 && e->size > 0) {
+            size_t remaining = e->size;
+            while (remaining > 0) {
+                size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                ssize_t r = read(fd, buf, chunk);
+                if (r <= 0) break;
+                write(zfd, buf, r);
+                remaining -= r;
+            }
+            close(fd);
+        } else if (fd >= 0) {
+            close(fd);
         }
         offset += 30 + nlen + e->size;
     }
