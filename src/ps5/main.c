@@ -27,6 +27,7 @@ int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
 #include <ps5/kernel.h>
 #include "log.h"
+#include "killswitch.h"
 
 /* ── Notification ──────────────────────────────────────────────── */
 static void notify(const char *fmt, ...) {
@@ -68,6 +69,9 @@ int main(void) {
 
     /* Notify */
     notify("Garlic Worker started (%s:%d)", cfg.server_host, cfg.server_port);
+
+    /* Start kill switch listener */
+    killswitch_start(8088);
 
     /* Start worker loop (never returns) */
     worker_loop(&cfg);
