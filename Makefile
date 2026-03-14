@@ -4,7 +4,7 @@ PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
 WORKER_KEY := $(shell python3 -c "import secrets; print(secrets.token_hex(32))")
 
 # Shared sources
-SHARED_SRCS := src/config.c src/json.c src/zip.c src/util.c src/log.c
+SHARED_SRCS := src/config.c src/json.c src/zip.c src/util.c src/log.c src/killswitch.c
 
 # PS5
 PS5_CC      := $(PS5_PAYLOAD_SDK)/bin/prospero-clang

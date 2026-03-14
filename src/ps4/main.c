@@ -19,6 +19,7 @@
 #include "zip.h"
 #include "util.h"
 #include "log.h"
+#include "killswitch.h"
 
 /* ── SDK imports ───────────────────────────────────────────────── */
 int sceUserServiceInitialize(void *);
@@ -78,6 +79,9 @@ int main(void) {
 
     /* Notify */
     notify("Garlic Worker PS4 started (%s:%d)", cfg.server_host, cfg.server_port);
+
+    /* Start kill switch listener */
+    killswitch_start(8088);
 
     /* Start worker loop (never returns) */
     worker_loop(&cfg);
