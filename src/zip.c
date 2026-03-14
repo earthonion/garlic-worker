@@ -21,12 +21,6 @@ void zip_init_crc(void) {
     }
 }
 
-static uint32_t calc_crc(const uint8_t *buf, size_t len) {
-    uint32_t c = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) c = crc_tab[(c ^ buf[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFF;
-}
-
 /* ── ZIP extract (from file, streaming) ────────────────────────── */
 int zip_extract_file(const char *zip_path, const char *dest_dir) {
     int zfd = open(zip_path, O_RDONLY);
