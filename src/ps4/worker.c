@@ -21,8 +21,12 @@
 
 /* ── Worker API helpers ────────────────────────────────────────── */
 
+static char g_last_error[2048];
+
 static void worker_log(worker_config_t *cfg, const char *job_id,
                        const char *level, const char *msg) {
+    if (strcmp(level, "ERROR") == 0)
+        snprintf(g_last_error, sizeof(g_last_error), "%s", msg);
     char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "/api/worker/jobs/%s/log", job_id);
     char body[4096];
@@ -737,6 +741,7 @@ void worker_loop(worker_config_t *cfg) {
         garlic_log("[Garlic] Job %s: %s\n", job_id, operation);
 
         /* Set status running */
+        g_last_error[0] = '\0';
         worker_set_status(cfg, job_id, "running", NULL);
 
         /* Create work directory */
@@ -764,7 +769,8 @@ void worker_loop(worker_config_t *cfg) {
         if (result == 0)
             worker_set_status(cfg, job_id, "done", NULL);
         else if (result < 0)
-            worker_set_status(cfg, job_id, "failed", NULL);
+            worker_set_status(cfg, job_id, "failed",
+                              g_last_error[0] ? g_last_error : NULL);
 
         /* Force unmount if still mounted */
         if (save_is_mounted())
