@@ -23,6 +23,7 @@ int sceNetResolverStartNtoa(int rid, const char *hostname,
                              struct in_addr *addr, int timeout,
                              int retries, int flags);
 int sceNetResolverDestroy(int rid);
+int sceNetPoolDestroy(int poolid);
 
 static int g_net_pool = -1;
 
@@ -435,4 +436,12 @@ int http_upload_file_chunked(const char *host, int port,
     garlic_log("[Garlic] Chunked upload complete (%lld bytes, %d chunks)\n",
            (long long)file_size, total_chunks);
     return 0;
+}
+
+void http_reset_pool(void) {
+    if (g_net_pool >= 0) {
+        sceNetPoolDestroy(g_net_pool);
+        g_net_pool = -1;
+    }
+    /* Will be recreated on next resolve_host() call */
 }
