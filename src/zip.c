@@ -27,56 +27,45 @@ static uint32_t calc_crc(const uint8_t *buf, size_t len) {
     return c ^ 0xFFFFFFFF;
 }
 
-/* ── ZIP extract (from file) ───────────────────────────────────── */
+/* ── ZIP extract (from file, streaming) ────────────────────────── */
 int zip_extract_file(const char *zip_path, const char *dest_dir) {
     int zfd = open(zip_path, O_RDONLY);
-    if (zfd < 0) return -1;
+    if (zfd < 0) {
+        garlic_log("[Garlic] zip_extract: cannot open %s\n", zip_path);
+        return -1;
+    }
 
     struct stat zst;
     fstat(zfd, &zst);
     size_t file_size = zst.st_size;
+    garlic_log("[Garlic] zip_extract: %s (%zu bytes)\n", zip_path, file_size);
 
-    /* Read entire ZIP into memory (saves are typically < 64MB) */
-    uint8_t *data = malloc(file_size);
-    if (!data) { close(zfd); return -1; }
-
-    size_t total_read = 0;
-    while (total_read < file_size) {
-        ssize_t n = read(zfd, data + total_read, file_size - total_read);
-        if (n <= 0) break;
-        total_read += n;
-    }
-    close(zfd);
-
-    if (total_read < file_size) {
-        free(data);
-        return -1;
-    }
-
-    /* Parse ZIP entries */
-    size_t off = 0;
     int count = 0;
+    uint8_t hdr[30];
 
-    while (off + 30 <= file_size) {
-        if (data[off] != 0x50 || data[off+1] != 0x4b ||
-            data[off+2] != 0x03 || data[off+3] != 0x04) break;
+    while (1) {
+        /* Read local file header */
+        ssize_t n = read(zfd, hdr, 30);
+        if (n < 30) break;
+        if (hdr[0] != 0x50 || hdr[1] != 0x4b || hdr[2] != 0x03 || hdr[3] != 0x04) break;
 
         uint16_t compression = 0, name_len = 0, extra_len = 0;
         uint32_t comp_size = 0, uncomp_size = 0;
-        memcpy(&compression, data + off + 8, 2);
-        memcpy(&comp_size, data + off + 18, 4);
-        memcpy(&uncomp_size, data + off + 22, 4);
-        memcpy(&name_len, data + off + 26, 2);
-        memcpy(&extra_len, data + off + 28, 2);
+        memcpy(&compression, hdr + 8, 2);
+        memcpy(&comp_size, hdr + 18, 4);
+        memcpy(&uncomp_size, hdr + 22, 4);
+        memcpy(&name_len, hdr + 26, 2);
+        memcpy(&extra_len, hdr + 28, 2);
 
         char name[MAX_PATH_LEN] = {0};
         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
-        memcpy(name, data + off + 30, copy_len);
-        off += 30 + name_len + extra_len;
+        if (read(zfd, name, copy_len) < copy_len) break;
+        if (name_len > copy_len) lseek(zfd, name_len - copy_len, SEEK_CUR);
+        if (extra_len > 0) lseek(zfd, extra_len, SEEK_CUR);
 
         if (compression != 0) {
             garlic_log("[Garlic] Skipping compressed entry: %s\n", name);
-            off += comp_size;
+            lseek(zfd, comp_size, SEEK_CUR);
             continue;
         }
 
@@ -85,8 +74,9 @@ int zip_extract_file(const char *zip_path, const char *dest_dir) {
             char dirpath[MAX_PATH_LEN];
             snprintf(dirpath, sizeof(dirpath), "%s/%s", dest_dir, name);
             mkdir_p(dirpath);
+            if (comp_size > 0) lseek(zfd, comp_size, SEEK_CUR);
         } else {
-            /* File entry */
+            /* File entry — stream to disk */
             char filepath[MAX_PATH_LEN];
             snprintf(filepath, sizeof(filepath), "%s/%s", dest_dir, name);
 
@@ -100,17 +90,24 @@ int zip_extract_file(const char *zip_path, const char *dest_dir) {
 
             int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
             if (fd >= 0) {
-                size_t to_write = uncomp_size;
-                if (off + to_write > file_size) to_write = file_size - off;
-                write(fd, data + off, to_write);
+                uint8_t buf[65536];
+                size_t remaining = uncomp_size;
+                while (remaining > 0) {
+                    size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+                    ssize_t r = read(zfd, buf, chunk);
+                    if (r <= 0) break;
+                    write(fd, buf, r);
+                    remaining -= r;
+                }
                 close(fd);
                 count++;
+            } else {
+                lseek(zfd, comp_size, SEEK_CUR);
             }
         }
-        off += comp_size;
     }
 
-    free(data);
+    close(zfd);
     garlic_log("[Garlic] Extracted %d files from %s\n", count, zip_path);
     return count;
 }
