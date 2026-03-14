@@ -37,8 +37,15 @@ int copy_file(const char *src, const char *dst) {
     if (dfd < 0) { close(sfd); return -2; }
     char buf[BUF_SIZE];
     ssize_t n;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0)
-        write(dfd, buf, n);
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t w = write(dfd, buf + written, n - written);
+            if (w <= 0) { close(sfd); close(dfd); return -3; }
+            written += w;
+        }
+    }
+    fsync(dfd);
     close(sfd);
     close(dfd);
     return 0;
