@@ -55,4 +55,7 @@ int save_is_mounted(void);
 /* Get mount point path */
 const char *save_get_mount_point(void);
 
+/* Periodic cleanup: force unmount, delete temp files in /data/save_files/ */
+void save_periodic_cleanup(void);
+
 #endif

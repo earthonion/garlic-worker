@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <dlfcn.h>
@@ -271,3 +272,30 @@ int save_mount_new(const char *image_path) {
 
 int save_is_mounted(void) { return g_mounted; }
 const char *save_get_mount_point(void) { return GARLIC_MOUNT_POINT; }
+
+/* ── Periodic cleanup ──────────────────────────────────────────── */
+void save_periodic_cleanup(void) {
+    /* Force unmount in case kernel state is stale */
+    if (g_mounted) save_unmount();
+
+    UmountOpt u0;
+    memset(&u0, 0, sizeof(u0));
+    sceFsInitUmountSaveDataOpt(&u0);
+    sceFsUmountSaveData(&u0, GARLIC_MOUNT_POINT, 0, 0);
+    g_mounted = 0;
+
+    /* Clean up any leftover temp files in /data/save_files/ */
+    DIR *d = opendir("/data/save_files");
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d))) {
+            if (ent->d_name[0] == '.') continue;
+            char fp[MAX_PATH_LEN];
+            snprintf(fp, sizeof(fp), "/data/save_files/%s", ent->d_name);
+            unlink(fp);
+        }
+        closedir(d);
+    }
+
+    garlic_log("[Garlic] Periodic cleanup done\n");
+}

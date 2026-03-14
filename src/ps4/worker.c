@@ -691,10 +691,14 @@ static int process_keyset(worker_config_t *cfg, const char *job_id,
 
 /* ── Main worker loop ──────────────────────────────────────────── */
 
+#define CLEANUP_INTERVAL 25  /* Run periodic cleanup every N jobs */
+
 void worker_loop(worker_config_t *cfg) {
     mkdir_p(WORK_BASE);
 
     garlic_log("[Garlic] Worker loop started (poll every %ds)\n", cfg->poll_interval);
+
+    int jobs_since_cleanup = 0;
 
     while (1) {
         http_response_t resp;
@@ -770,6 +774,15 @@ void worker_loop(worker_config_t *cfg) {
         delete_recursive(work_dir);
 
         garlic_log("[Garlic] Job %s complete (result=%d)\n", job_id, result);
+
+        /* Periodic cleanup to prevent kernel resource exhaustion */
+        jobs_since_cleanup++;
+        if (jobs_since_cleanup >= CLEANUP_INTERVAL) {
+            garlic_log("[Garlic] Running periodic cleanup after %d jobs...\n", jobs_since_cleanup);
+            save_periodic_cleanup();
+            jobs_since_cleanup = 0;
+        }
+
         sleep(2);
     }
 }
