@@ -308,8 +308,9 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
     }
     garlic_log("[Garlic] create_pfs: sealed key decrypted OK\n"); log_flush();
 
-    /* Size: data + 25% overhead + 4MB, min 32MB, aligned to 32K */
-    uint64_t img_size = data_size + (data_size / 4) + (4 * 1024 * 1024);
+    /* Use exact size from SAVEDATA_BLOCKS — no overhead needed.
+     * The PS4 expects the image to be exactly blocks * 32KB. */
+    uint64_t img_size = data_size;
     if (img_size < 32 * 1024 * 1024)
         img_size = 32 * 1024 * 1024;
     img_size = ((img_size + 32767) / 32768) * 32768;

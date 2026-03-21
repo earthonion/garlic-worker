@@ -87,6 +87,55 @@ int mkdir_p(const char *path) {
     return mkdir(tmp, 0777);
 }
 
+static int _is_sce_sys_path(const char *relpath) {
+    return strncmp(relpath, "sce_sys", 7) == 0 &&
+           (relpath[7] == '/' || relpath[7] == '\0');
+}
+
+static int _copy_pfs_recursive(const char *src, const char *dst,
+                                const char *src_base) {
+    mkdir(dst, 0777);
+    DIR *d = opendir(src);
+    if (!d) return -1;
+
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char sp[MAX_PATH_LEN], dp[MAX_PATH_LEN];
+        snprintf(sp, sizeof(sp), "%s/%s", src, ent->d_name);
+        snprintf(dp, sizeof(dp), "%s/%s", dst, ent->d_name);
+
+        /* Compute relative path from source base for uid decision */
+        const char *relpath = sp + strlen(src_base);
+        if (*relpath == '/') relpath++;
+
+        /* sce_sys and memory.dat → uid 0, everything else → uid 1 */
+        if (_is_sce_sys_path(relpath) || strcmp(ent->d_name, "memory.dat") == 0)
+            setuid(0);
+        else
+            setuid(1);
+
+        struct stat st;
+        if (stat(sp, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            _copy_pfs_recursive(sp, dp, src_base);
+        } else {
+            /* Create file first (like cecie.nim does) */
+            int fd = open(dp, O_CREAT | O_TRUNC, 0777);
+            if (fd >= 0) close(fd);
+            copy_file(sp, dp);
+        }
+    }
+    closedir(d);
+    setuid(0);
+    return 0;
+}
+
+int copy_dir_pfs(const char *src, const char *dst) {
+    return _copy_pfs_recursive(src, dst, src);
+}
+
 int hex_to_bytes(const char *hex, uint8_t *out, int max_bytes) {
     const char *s = hex;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
