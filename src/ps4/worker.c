@@ -299,10 +299,11 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         return -1;
     }
 
-    /* Copy files into mounted PFS */
+    /* Copy files into mounted PFS with correct uid:
+     * sce_sys and memory.dat → uid 0, everything else → uid 1 */
     worker_log(cfg, job_id, "INFO", "Copying files into PFS...");
     const char *mnt = save_get_mount_point();
-    copy_dir_recursive(files_dir, mnt);
+    copy_dir_pfs(files_dir, mnt);
     sync();
 
     /* Patch account ID if provided */
