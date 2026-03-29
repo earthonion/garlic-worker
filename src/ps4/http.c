@@ -54,7 +54,7 @@ static in_addr_t resolve_host(const char *host) {
 
 /* ── Internal helpers ──────────────────────────────────────────── */
 
-static int tcp_connect(const char *host, int port) {
+int http_tcp_connect(const char *host, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
@@ -169,7 +169,7 @@ int http_get(const char *host, int port, const char *path,
              const char *worker_key, http_response_t *resp) {
     memset(resp, 0, sizeof(*resp));
 
-    int sock = tcp_connect(host, port);
+    int sock = http_tcp_connect(host, port);
     if (sock < 0) return -1;
 
     if (send_request(sock, "GET", host, path, worker_key, NULL, -1) < 0) {
@@ -206,7 +206,7 @@ int http_post_json(const char *host, int port, const char *path,
                    http_response_t *resp) {
     memset(resp, 0, sizeof(*resp));
 
-    int sock = tcp_connect(host, port);
+    int sock = http_tcp_connect(host, port);
     if (sock < 0) return -1;
 
     int body_len = json_body ? strlen(json_body) : 0;
@@ -247,7 +247,7 @@ int http_post_binary(const char *host, int port, const char *path,
                      const char *worker_key, http_response_t *resp) {
     memset(resp, 0, sizeof(*resp));
 
-    int sock = tcp_connect(host, port);
+    int sock = http_tcp_connect(host, port);
     if (sock < 0) return -1;
 
     if (send_request(sock, "POST", host, path, worker_key,
@@ -284,7 +284,7 @@ int http_post_binary(const char *host, int port, const char *path,
 
 int http_download_to_file(const char *host, int port, const char *path,
                           const char *worker_key, const char *dest_path) {
-    int sock = tcp_connect(host, port);
+    int sock = http_tcp_connect(host, port);
     if (sock < 0) return -1;
 
     if (send_request(sock, "GET", host, path, worker_key, NULL, -1) < 0) {

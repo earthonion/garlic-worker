@@ -38,6 +38,8 @@ int config_load(const char *path, worker_config_t *cfg) {
     cfg->server_port = 80;
     snprintf(cfg->worker_key, sizeof(cfg->worker_key), "%s", WORKER_KEY);
     cfg->poll_interval = 60;
+    cfg->connection_mode = 0;  /* http */
+    cfg->tcp_port = 9090;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -81,6 +83,14 @@ int config_load(const char *path, worker_config_t *cfg) {
                 snprintf(cfg->worker_key, sizeof(cfg->worker_key), "%s", val);
             else if (strcmp(key, "pollInterval") == 0)
                 cfg->poll_interval = atoi(val);
+            else if (strcmp(key, "connectionMode") == 0) {
+                if (strcmp(val, "tcp") == 0)
+                    cfg->connection_mode = 1;
+                else
+                    cfg->connection_mode = 0;
+            }
+            else if (strcmp(key, "tcpPort") == 0)
+                cfg->tcp_port = atoi(val);
         }
         line = nl ? nl + 1 : NULL;
     }

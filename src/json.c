@@ -63,6 +63,14 @@ int json_get_int(const char *json, const char *key, int *out) {
     return 0;
 }
 
+int json_get_int64(const char *json, const char *key, int64_t *out) {
+    const char *val = find_key(json, key);
+    if (!val) return -1;
+    if (*val == '"') val++;
+    *out = strtoll(val, NULL, 10);
+    return 0;
+}
+
 int json_get_bool(const char *json, const char *key, int *out) {
     const char *val = find_key(json, key);
     if (!val) return -1;
