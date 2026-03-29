@@ -11,6 +11,7 @@
 #include "http.h"
 #include "json.h"
 #include "zip.h"
+#include "tcp.h"
 #include "savedata.h"
 #include "util.h"
 #include "log.h"
@@ -18,6 +19,11 @@
 #define WORK_BASE      "/data/garlic/work"
 #define SFO_AID_OFFSET 0x1B8   /* PS5 account ID offset in param.sfo */
 #define KEYSTONE_SIZE  0x400
+
+/* ── Transport mode (0=HTTP, 1=TCP) ────────────────────────────── */
+
+static int g_transport_mode = 0;
+static tcp_conn_t *g_tcp = NULL;
 
 /* ── Worker API helpers ────────────────────────────────────────── */
 
@@ -27,12 +33,21 @@ static void worker_log(worker_config_t *cfg, const char *job_id,
                        const char *level, const char *msg) {
     if (strcmp(level, "ERROR") == 0)
         snprintf(g_last_error, sizeof(g_last_error), "%s", msg);
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "/api/worker/jobs/%s/log", job_id);
-    char body[4096];
-    snprintf(body, sizeof(body), "{\"level\":\"%s\",\"msg\":\"%s\"}", level, msg);
-    http_response_t resp;
-    http_post_json(cfg->server_host, cfg->server_port, path, body, cfg->worker_key, &resp);
+
+    if (g_transport_mode == 1 && g_tcp) {
+        char body[4096];
+        snprintf(body, sizeof(body),
+            "{\"type\":\"log\",\"job_id\":\"%s\",\"level\":\"%s\",\"msg\":\"%s\"}",
+            job_id, level, msg);
+        tcp_send_msg(g_tcp, body);
+    } else {
+        char path[MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "/api/worker/jobs/%s/log", job_id);
+        char body[4096];
+        snprintf(body, sizeof(body), "{\"level\":\"%s\",\"msg\":\"%s\"}", level, msg);
+        http_response_t resp;
+        http_post_json(cfg->server_host, cfg->server_port, path, body, cfg->worker_key, &resp);
+    }
 }
 
 static void worker_logf(worker_config_t *cfg, const char *job_id,
@@ -47,29 +62,75 @@ static void worker_logf(worker_config_t *cfg, const char *job_id,
 
 static void worker_set_status(worker_config_t *cfg, const char *job_id,
                               const char *status, const char *error) {
-    char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "/api/worker/jobs/%s/status", job_id);
-    char body[4096];
-    if (error)
-        snprintf(body, sizeof(body), "{\"status\":\"%s\",\"error\":\"%s\"}", status, error);
-    else
-        snprintf(body, sizeof(body), "{\"status\":\"%s\"}", status);
-    http_response_t resp;
-    http_post_json(cfg->server_host, cfg->server_port, path, body, cfg->worker_key, &resp);
+    if (g_transport_mode == 1 && g_tcp) {
+        char body[4096];
+        if (error)
+            snprintf(body, sizeof(body),
+                "{\"type\":\"status\",\"job_id\":\"%s\",\"status\":\"%s\",\"error\":\"%s\"}",
+                job_id, status, error);
+        else
+            snprintf(body, sizeof(body),
+                "{\"type\":\"status\",\"job_id\":\"%s\",\"status\":\"%s\"}",
+                job_id, status);
+        tcp_send_msg(g_tcp, body);
+    } else {
+        char path[MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "/api/worker/jobs/%s/status", job_id);
+        char body[4096];
+        if (error)
+            snprintf(body, sizeof(body), "{\"status\":\"%s\",\"error\":\"%s\"}", status, error);
+        else
+            snprintf(body, sizeof(body), "{\"status\":\"%s\"}", status);
+        http_response_t resp;
+        http_post_json(cfg->server_host, cfg->server_port, path, body, cfg->worker_key, &resp);
+    }
 }
 
 static int worker_download_files(worker_config_t *cfg, const char *job_id,
                                  const char *work_dir) {
-    char url[MAX_PATH_LEN];
-    snprintf(url, sizeof(url), "/api/worker/jobs/%s/files", job_id);
     char zip_path[MAX_PATH_LEN];
     snprintf(zip_path, sizeof(zip_path), "%s/files.zip", work_dir);
 
-    int status = http_download_to_file(cfg->server_host, cfg->server_port,
-                                       url, cfg->worker_key, zip_path);
-    if (status != 200) {
-        garlic_log("[Garlic] Download files failed (status=%d)\n", status);
-        return -1;
+    if (g_transport_mode == 1 && g_tcp) {
+        char req[256];
+        snprintf(req, sizeof(req), "{\"type\":\"file_request\",\"job_id\":\"%s\"}", job_id);
+        if (tcp_send_msg(g_tcp, req) < 0) {
+            garlic_log("[TCP] Failed to send file_request\n");
+            return -1;
+        }
+
+        char resp_buf[4096];
+        if (tcp_recv_msg(g_tcp, resp_buf, sizeof(resp_buf)) < 0) {
+            garlic_log("[TCP] Failed to receive file_data header\n");
+            return -1;
+        }
+
+        int64_t file_size = 0;
+        json_get_int64(resp_buf, "size", &file_size);
+        if (file_size <= 0) {
+            garlic_log("[TCP] Server sent empty file (size=%lld)\n", (long long)file_size);
+            return -1;
+        }
+
+        int fd = open(zip_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0) return -1;
+        if (tcp_recv_to_file(g_tcp, fd, file_size) < 0) {
+            close(fd);
+            garlic_log("[TCP] Failed to receive file data\n");
+            return -1;
+        }
+        close(fd);
+        garlic_log("[TCP] Downloaded %lld bytes\n", (long long)file_size);
+    } else {
+        char url[MAX_PATH_LEN];
+        snprintf(url, sizeof(url), "/api/worker/jobs/%s/files", job_id);
+
+        int status = http_download_to_file(cfg->server_host, cfg->server_port,
+                                           url, cfg->worker_key, zip_path);
+        if (status != 200) {
+            garlic_log("[Garlic] Download files failed (status=%d)\n", status);
+            return -1;
+        }
     }
 
     char files_dir[MAX_PATH_LEN];
@@ -88,10 +149,28 @@ static int worker_download_files(worker_config_t *cfg, const char *job_id,
 
 static int worker_upload_result(worker_config_t *cfg, const char *job_id,
                                 const char *zip_path) {
-    char base_path[MAX_PATH_LEN];
-    snprintf(base_path, sizeof(base_path), "/api/worker/jobs/%s/result", job_id);
-    return http_upload_file_chunked(cfg->server_host, cfg->server_port,
-                                    base_path, zip_path, cfg->worker_key);
+    if (g_transport_mode == 1 && g_tcp) {
+        struct stat st;
+        if (stat(zip_path, &st) < 0) return -1;
+
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+            "{\"type\":\"result_start\",\"job_id\":\"%s\",\"size\":%lld}",
+            job_id, (long long)st.st_size);
+        if (tcp_send_msg(g_tcp, msg) < 0) return -1;
+        if (tcp_send_file(g_tcp, zip_path) < 0) return -1;
+
+        char resp_buf[4096];
+        if (tcp_recv_msg(g_tcp, resp_buf, sizeof(resp_buf)) < 0) return -1;
+
+        garlic_log("[TCP] Upload complete (%lld bytes)\n", (long long)st.st_size);
+        return 0;
+    } else {
+        char base_path[MAX_PATH_LEN];
+        snprintf(base_path, sizeof(base_path), "/api/worker/jobs/%s/result", job_id);
+        return http_upload_file_chunked(cfg->server_host, cfg->server_port,
+                                        base_path, zip_path, cfg->worker_key);
+    }
 }
 
 /* ── Copy all files from a mounted save to result dir ──────────── */
@@ -744,5 +823,142 @@ void worker_loop(worker_config_t *cfg) {
         }
 
         sleep(2); /* Brief pause before next poll */
+    }
+}
+
+/* ── TCP direct-connect worker loop ────────────────────────────── */
+
+void worker_loop_tcp(worker_config_t *cfg) {
+    mkdir_p(WORK_BASE);
+
+    g_transport_mode = 1;
+    tcp_conn_t conn;
+    g_tcp = &conn;
+
+    int backoff = 2;
+    int jobs_since_cleanup = 0;
+
+    garlic_log("[TCP] Worker loop started (server %s:%d)\n",
+               cfg->server_host, cfg->tcp_port);
+
+    while (1) {
+        garlic_log("[TCP] Connecting to %s:%d...\n", cfg->server_host, cfg->tcp_port);
+        if (tcp_connect_server(&conn, cfg->server_host, cfg->tcp_port) < 0) {
+            garlic_log("[TCP] Connection failed, retry in %ds\n", backoff);
+            sleep(backoff);
+            if (backoff < 60) backoff *= 2;
+            continue;
+        }
+        garlic_log("[TCP] Connected\n");
+
+        /* Authenticate */
+        char auth_msg[512];
+        snprintf(auth_msg, sizeof(auth_msg),
+            "{\"type\":\"auth\",\"key\":\"%s\",\"platform\":\"ps5\"}",
+            cfg->worker_key);
+        if (tcp_send_msg(&conn, auth_msg) < 0) {
+            tcp_disconnect(&conn);
+            sleep(backoff);
+            if (backoff < 60) backoff *= 2;
+            continue;
+        }
+
+        char resp[8192];
+        if (tcp_recv_msg(&conn, resp, sizeof(resp)) < 0) {
+            tcp_disconnect(&conn);
+            sleep(backoff);
+            if (backoff < 60) backoff *= 2;
+            continue;
+        }
+
+        char auth_type[32] = {0};
+        json_get_string(resp, "type", auth_type, sizeof(auth_type));
+        if (strcmp(auth_type, "auth_ok") != 0) {
+            garlic_log("[TCP] Auth failed\n");
+            tcp_disconnect(&conn);
+            sleep(30);
+            continue;
+        }
+
+        garlic_log("[TCP] Authenticated\n");
+        backoff = 2;
+
+        while (conn.connected) {
+            if (tcp_send_msg(&conn, "{\"type\":\"ready\"}") < 0) break;
+
+            if (tcp_recv_msg(&conn, resp, sizeof(resp)) < 0) {
+                garlic_log("[TCP] Connection lost while waiting\n");
+                break;
+            }
+
+            char msg_type[32] = {0};
+            json_get_string(resp, "type", msg_type, sizeof(msg_type));
+
+            if (strcmp(msg_type, "no_job") == 0) {
+                sleep(cfg->poll_interval > 0 ? cfg->poll_interval : 10);
+                continue;
+            }
+
+            if (strcmp(msg_type, "job") != 0) {
+                garlic_log("[TCP] Unexpected message type: %s\n", msg_type);
+                continue;
+            }
+
+            char job_id[64] = {0}, operation[32] = {0}, params[8192] = {0};
+            json_get_string(resp, "id", job_id, sizeof(job_id));
+            json_get_string(resp, "operation", operation, sizeof(operation));
+            json_get_object(resp, "params", params, sizeof(params));
+
+            if (!job_id[0] || !operation[0]) continue;
+
+            garlic_log("[TCP] Job %s: %s\n", job_id, operation);
+            g_last_error[0] = '\0';
+
+            char work_dir[MAX_PATH_LEN];
+            snprintf(work_dir, sizeof(work_dir), "%s/%.8s", WORK_BASE, job_id);
+            mkdir_p(work_dir);
+
+            int result = -1;
+            if (strcmp(operation, "decrypt") == 0)
+                result = process_decrypt(cfg, job_id, params, work_dir);
+            else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
+                result = process_encrypt(cfg, job_id, params, work_dir);
+            else if (strcmp(operation, "resign") == 0)
+                result = process_resign(cfg, job_id, params, work_dir);
+            else if (strcmp(operation, "reregion") == 0)
+                result = process_reregion(cfg, job_id, params, work_dir);
+            else if (strcmp(operation, "keyset") == 0)
+                result = process_keyset(cfg, job_id, params, work_dir);
+            else
+                worker_logf(cfg, job_id, "ERROR", "Unknown operation: %s", operation);
+
+            if (result == 0)
+                worker_set_status(cfg, job_id, "done", NULL);
+            else if (result < 0)
+                worker_set_status(cfg, job_id, "failed",
+                                  g_last_error[0] ? g_last_error : NULL);
+
+            if (save_is_mounted())
+                save_unmount();
+
+            delete_recursive(work_dir);
+            garlic_log("[TCP] Job %s complete (result=%d)\n", job_id, result);
+
+            jobs_since_cleanup++;
+            if (jobs_since_cleanup >= CLEANUP_INTERVAL) {
+                garlic_log("[TCP] Running periodic cleanup after %d jobs...\n",
+                           jobs_since_cleanup);
+                save_periodic_cleanup();
+                http_reset_pool();
+                jobs_since_cleanup = 0;
+            }
+
+            sleep(1);
+        }
+
+        tcp_disconnect(&conn);
+        garlic_log("[TCP] Disconnected, reconnecting in %ds...\n", backoff);
+        sleep(backoff);
+        if (backoff < 60) backoff *= 2;
     }
 }

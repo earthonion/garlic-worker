@@ -77,14 +77,17 @@ int main(void) {
 
     config_load("/data/garlic/config.ini", &cfg);
 
-    /* Notify */
-    notify("Garlic Worker PS4 started (%s:%d)", cfg.server_host, cfg.server_port);
-
     /* Start kill switch listener */
     killswitch_start(8088);
 
     /* Start worker loop (never returns) */
-    worker_loop(&cfg);
+    if (cfg.connection_mode == 1) {
+        notify("Garlic Worker PS4 started (TCP %s:%d)", cfg.server_host, cfg.tcp_port);
+        worker_loop_tcp(&cfg);
+    } else {
+        notify("Garlic Worker PS4 started (%s:%d)", cfg.server_host, cfg.server_port);
+        worker_loop(&cfg);
+    }
 
     return 0;
 }
