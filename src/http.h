@@ -38,4 +38,7 @@ int http_upload_file_chunked(const char *host, int port,
 /* Destroy and recreate DNS resolver pool to prevent fragmentation */
 void http_reset_pool(void);
 
+/* Create a TCP connection to host:port (exposed for TCP transport) */
+int http_tcp_connect(const char *host, int port);
+
 #endif
