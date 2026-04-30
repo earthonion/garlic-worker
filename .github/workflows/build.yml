@@ -1,55 +1,33 @@
-name: Build and Release
-
+name: Build
 on:
   push:
     branches: [main]
-
+  workflow_dispatch:
 permissions:
   contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install LLVM
+      - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm clang lld
-
-      - name: Download PS5 SDK
+          sudo apt-get install -y llvm clang lld xxd unzip wget
+      - name: Download SDKs
         run: |
-          curl -sL "$(gh api repos/ps5-payload-dev/sdk/releases/latest --jq '.assets[0].browser_download_url')" -o ps5-sdk.zip
-          unzip -q ps5-sdk.zip -d ps5-sdk
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Download PS4 SDK
-        run: |
-          curl -sL "$(gh api repos/ps4-payload-dev/sdk/releases/latest --jq '.assets[0].browser_download_url')" -o ps4-sdk.zip
-          unzip -q ps4-sdk.zip -d ps4-sdk
-        env:
-          GH_TOKEN: ${{ github.token }}
-
+          wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+          unzip -q ps5-payload-sdk.zip -d ps5-sdk
+          wget -q https://github.com/ps4-payload-dev/sdk/releases/latest/download/ps4-payload-sdk.zip
+          unzip -q ps4-payload-sdk.zip -d ps4-sdk
       - name: Build PS5
         run: make ps5 PS5_PAYLOAD_SDK=$PWD/ps5-sdk/ps5-payload-sdk
-
       - name: Build PS4
         run: make ps4 PS4_PAYLOAD_SDK=$PWD/ps4-sdk/ps4-payload-sdk
-
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Create Release
-        run: |
-          gh release delete latest --yes 2>/dev/null || true
-          gh release create latest \
-            --title "Build ${{ steps.sha.outputs.short }}" \
-            --notes "Automated build from commit ${{ github.sha }}" \
-            --prerelease \
-            garlic-worker-ps5.elf \
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: garlic-worker
+          path: |
+            garlic-worker-ps5.elf
             garlic-worker-ps4.elf
-        env:
-          GH_TOKEN: ${{ github.token }}
