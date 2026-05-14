@@ -18,7 +18,11 @@
 #include "log.h"
 
 #define WORK_BASE      "/data/garlic/work"
-#define SFO_AID_OFFSET 0x1B8   /* PS5 account ID offset in param.sfo */
+/* PS4 and PS5 save files use different param.sfo key tables, so the
+ * ACCOUNT_ID byte offset differs. Pick by save type at patch time. */
+#define SFO_AID_OFFSET     0x1B8  /* default: PS5 param.sfo */
+#define SFO_AID_OFFSET_PS5 0x1B8
+#define SFO_AID_OFFSET_PS4 0x15C
 #define KEYSTONE_SIZE  0x400
 
 /* ── Transport mode (0=HTTP, 1=TCP) ────────────────────────────── */
@@ -541,7 +545,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
             int sfo_fd = open(sfo_path, O_RDWR);
             if (sfo_fd >= 0) {
-                pwrite(sfo_fd, new_aid, 8, SFO_AID_OFFSET);
+                pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
                 close(sfo_fd);
                 sync();
                 worker_log(cfg, job_id, "INFO", "Patched account ID");
@@ -587,7 +591,8 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 }
 
 static int process_resign(worker_config_t *cfg, const char *job_id,
-                          const char *params, const char *work_dir) {
+                          const char *params, const char *work_dir,
+                          int is_ps4_job) {
     char account_id[64] = {0};
     json_get_string(params, "account_id", account_id, sizeof(account_id));
     if (!account_id[0]) {
@@ -652,7 +657,7 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
                  save_get_mount_point());
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, SFO_AID_OFFSET);
+            pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
             close(sfo_fd);
             sync();
         } else {
@@ -702,7 +707,8 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
 }
 
 static int process_reregion(worker_config_t *cfg, const char *job_id,
-                            const char *params, const char *work_dir) {
+                            const char *params, const char *work_dir,
+                            int is_ps4_job) {
     char account_id[64] = {0};
     json_get_string(params, "account_id", account_id, sizeof(account_id));
     if (!account_id[0]) {
@@ -826,7 +832,7 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, SFO_AID_OFFSET);
+            pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
             close(sfo_fd);
         }
 
@@ -989,9 +995,9 @@ void worker_loop(worker_config_t *cfg) {
         else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
             result = process_encrypt(cfg, job_id, params, work_dir, is_ps4_job);
         else if (strcmp(operation, "resign") == 0)
-            result = process_resign(cfg, job_id, params, work_dir);
+            result = process_resign(cfg, job_id, params, work_dir, is_ps4_job);
         else if (strcmp(operation, "reregion") == 0)
-            result = process_reregion(cfg, job_id, params, work_dir);
+            result = process_reregion(cfg, job_id, params, work_dir, is_ps4_job);
         else if (strcmp(operation, "keyset") == 0)
             result = process_keyset(cfg, job_id, params, work_dir);
         else {
@@ -1127,9 +1133,9 @@ void worker_loop_tcp(worker_config_t *cfg) {
                 /* TCP path is PS5-only (auth advertises ps5); pass is_ps4_job=0 */
                 result = process_encrypt(cfg, job_id, params, work_dir, 0);
             else if (strcmp(operation, "resign") == 0)
-                result = process_resign(cfg, job_id, params, work_dir);
+                result = process_resign(cfg, job_id, params, work_dir, 0);
             else if (strcmp(operation, "reregion") == 0)
-                result = process_reregion(cfg, job_id, params, work_dir);
+                result = process_reregion(cfg, job_id, params, work_dir, 0);
             else if (strcmp(operation, "keyset") == 0)
                 result = process_keyset(cfg, job_id, params, work_dir);
             else
