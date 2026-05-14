@@ -78,9 +78,10 @@ int save_mount(const char *save_path) {
     g_local_copy[0] = 0;
     int is_on_data = (strncmp(save_path, "/data/", 6) == 0);
 
+    const char *basename = strrchr(save_path, '/');
+    basename = basename ? basename + 1 : save_path;
+
     if (!is_on_data) {
-        const char *basename = strrchr(save_path, '/');
-        basename = basename ? basename + 1 : save_path;
         snprintf(g_local_copy, sizeof(g_local_copy), "/data/save_files/%s", basename);
         garlic_log("[Garlic] Copying %s -> %s\n", save_path, g_local_copy);
         if (copy_file(save_path, g_local_copy) < 0) {
@@ -89,17 +90,17 @@ int save_mount(const char *save_path) {
         }
         chmod(g_local_copy, 0755);
         mount_src = g_local_copy;
+    }
 
-        /* PS4: also copy companion .bin (sealed key) into /data/save_files/ */
-        if (is_ps4 && strncmp(basename, "sdimg_", 6) == 0) {
-            const char *savename = basename + 6;
-            char src_dir[MAX_PATH_LEN], src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
-            strncpy(src_dir, save_path, sizeof(src_dir) - 1);
-            src_dir[sizeof(src_dir) - 1] = 0;
-            char *sl = strrchr(src_dir, '/');
-            if (sl) *(sl + 1) = 0; else src_dir[0] = 0;
-            snprintf(src_bin, sizeof(src_bin), "%s%s.bin", src_dir, savename);
-            snprintf(dst_bin, sizeof(dst_bin), "/data/save_files/%s.bin", savename);
+    /* PS4: ensure the companion .bin (sealed key) is at /data/save_files/<basename>.bin.
+     * Companion is always at <save_path>.bin regardless of naming convention
+     * (HTOS uploads use plain names, real PS4 hw uses sdimg_<name>). Runs whether
+     * or not the image was already in /data — the .bin may still be elsewhere. */
+    if (is_ps4) {
+        char src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
+        snprintf(src_bin, sizeof(src_bin), "%s.bin", save_path);
+        snprintf(dst_bin, sizeof(dst_bin), "%s.bin", mount_src);
+        if (strcmp(src_bin, dst_bin) != 0) {
             if (copy_file(src_bin, dst_bin) < 0) {
                 garlic_log("[Garlic] PS4: companion .bin missing at %s (errno %d)\n",
                            src_bin, errno);
@@ -121,21 +122,9 @@ int save_mount(const char *save_path) {
 
     int ret;
     if (is_ps4) {
-        /* PS4: read 0x60 sealed-key bytes from companion .bin */
-        const char *bname = strrchr(mount_src, '/');
-        bname = bname ? bname + 1 : mount_src;
-        if (strncmp(bname, "sdimg_", 6) != 0) {
-            garlic_log("[Garlic] PS4 save expected to be 'sdimg_*' (got %s)\n", bname);
-            free(pfsbuf);
-            return -3;
-        }
-        const char *savename = bname + 6;
-        char dir[MAX_PATH_LEN], bin_path[MAX_PATH_LEN];
-        strncpy(dir, mount_src, sizeof(dir) - 1);
-        dir[sizeof(dir) - 1] = 0;
-        char *slash = strrchr(dir, '/');
-        if (slash) *(slash + 1) = 0; else dir[0] = 0;
-        snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, savename);
+        /* PS4: read 0x60 sealed-key bytes from companion .bin at <image>.bin */
+        char bin_path[MAX_PATH_LEN];
+        snprintf(bin_path, sizeof(bin_path), "%s.bin", mount_src);
 
         garlic_log("[Garlic] Opening PS4 sealed key %s\n", bin_path);
         int fd = open(bin_path, O_RDONLY);
@@ -320,6 +309,177 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
 
     garlic_log("[Garlic] Formatted PFS image OK\n");
     return 0;
+}
+
+/* ── Create new PS4-format PFS image with sealed-key companion .bin ── */
+int save_create_pfs_ps4(const char *image_path, uint64_t data_size) {
+    kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+    /* Save path early — ioctl calls may corrupt the stack. */
+    char path_copy[MAX_PATH_LEN];
+    strncpy(path_copy, image_path, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = 0;
+
+    /* Generate a fresh PS4 sealed key via pfsmgr ioctl 0x40845303 (96 bytes). */
+    uint8_t *buf = malloc(0x100);
+    if (!buf) return -1;
+    memset(buf, 0, 0x100);
+
+    int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+    if (pfsmgr < 0) {
+        garlic_log("[Garlic] PS4 create: cannot open /dev/pfsmgr (errno %d)\n", errno);
+        free(buf);
+        return -1;
+    }
+    int ret = ioctl(pfsmgr, 0x40845303, buf);
+    close(pfsmgr);
+    if (ret < 0) {
+        garlic_log("[Garlic] PS4 create: generate sealed key ioctl failed (ret=%d, errno=%d)\n",
+                   ret, errno);
+        free(buf);
+        return -2;
+    }
+
+    uint8_t sealed_key[96];
+    memcpy(sealed_key, buf, 96);
+    garlic_log("[Garlic] PS4 create: sealed key generated (keyset=%d)\n",
+               (sealed_key[9] << 8) | sealed_key[8]);
+
+    /* Decrypt to get the 32-byte working key. */
+    memset(buf, 0, 0x100);
+    memcpy(buf, sealed_key, 96);
+    pfsmgr = open("/dev/pfsmgr", O_RDWR);
+    if (pfsmgr < 0) {
+        garlic_log("[Garlic] PS4 create: cannot reopen pfsmgr for decrypt\n");
+        free(buf);
+        return -3;
+    }
+    ret = ioctl(pfsmgr, 0xc0845302, buf);
+    close(pfsmgr);
+    if (ret < 0) {
+        garlic_log("[Garlic] PS4 create: decrypt sealed key ioctl failed (ret=%d)\n", ret);
+        free(buf);
+        return -3;
+    }
+    uint8_t decrypted_key[32];
+    memcpy(decrypted_key, buf + 96, 32);
+    free(buf);
+
+    /* Size: PS4 expects exact blocks × 32KB. */
+    uint64_t img_size = data_size;
+    if (img_size < 32 * 1024 * 1024)
+        img_size = 32 * 1024 * 1024;
+    img_size = ((img_size + 32767) / 32768) * 32768;
+
+    int fd = open(path_copy, O_CREAT | O_TRUNC | O_RDWR, 0777);
+    if (fd < 0) {
+        garlic_log("[Garlic] PS4 create: cannot create image %s (errno %d)\n",
+                   path_copy, errno);
+        return -4;
+    }
+    ret = sceFsUfsAllocateSaveData(fd, img_size, 0, 0);
+    if (ret < 0) {
+        garlic_log("[Garlic] PS4 create: UfsAllocate failed (0x%x), using ftruncate\n", ret);
+        if (ftruncate(fd, img_size) < 0) {
+            close(fd);
+            unlink(path_copy);
+            return -5;
+        }
+    }
+    close(fd);
+
+    /* Format as PS4-style PFS (non-Ppr CreatePfsSaveDataImage). */
+    CreateOpt copt;
+    memset(&copt, 0, sizeof(copt));
+    sceFsInitCreatePfsSaveDataOpt(&copt);
+    ret = sceFsCreatePfsSaveDataImage(&copt, path_copy, 0, img_size, decrypted_key);
+    if (ret < 0) {
+        garlic_log("[Garlic] PS4 create: CreatePfsSaveDataImage failed (0x%x)\n", ret);
+        unlink(path_copy);
+        return -6;
+    }
+
+    /* Sync image to disk. */
+    fd = open(path_copy, O_RDONLY);
+    if (fd >= 0) { fsync(fd); close(fd); }
+
+    /* Write companion .bin (96-byte sealed key). */
+    char bin_path[MAX_PATH_LEN];
+    snprintf(bin_path, sizeof(bin_path), "%s.bin", path_copy);
+    fd = open(bin_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        garlic_log("[Garlic] PS4 create: cannot write %s (errno %d)\n", bin_path, errno);
+        return -7;
+    }
+    if (write(fd, sealed_key, 96) != 96) {
+        garlic_log("[Garlic] PS4 create: short write on .bin\n");
+        close(fd);
+        return -8;
+    }
+    close(fd);
+
+    garlic_log("[Garlic] PS4 create: image + .bin written OK (%llu bytes)\n",
+               (unsigned long long)img_size);
+    return 0;
+}
+
+/* ── Mount a freshly created PS4 PFS image ────────────────────────
+ * The sealed key lives in <image>.bin; decrypt it via pfsmgr then
+ * mount with sceFsMountSaveData. */
+int save_mount_new_ps4(const char *image_path) {
+    if (g_mounted) save_unmount();
+
+    kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+    /* Load + decrypt sealed key from .bin */
+    char bin_path[MAX_PATH_LEN];
+    snprintf(bin_path, sizeof(bin_path), "%s.bin", image_path);
+
+    uint8_t *buf = malloc(0x100);
+    if (!buf) return -1;
+    memset(buf, 0, 0x100);
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        garlic_log("[Garlic] mount_new_ps4: cannot open %s (errno %d)\n", bin_path, errno);
+        free(buf);
+        return -2;
+    }
+    int r = read(fd, buf, 96);
+    close(fd);
+    if (r != 96) {
+        garlic_log("[Garlic] mount_new_ps4: short read on .bin (%d)\n", r);
+        free(buf);
+        return -3;
+    }
+
+    int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+    uint8_t decrypted[32] = {0};
+    if (pfsmgr >= 0) {
+        int ret = ioctl(pfsmgr, 0xc0845302, buf);
+        close(pfsmgr);
+        if (ret >= 0) memcpy(decrypted, buf + 96, 32);
+        else garlic_log("[Garlic] mount_new_ps4: decrypt ioctl failed (ret=%d)\n", ret);
+    }
+    free(buf);
+
+    MountOpt mopt;
+    memset(&mopt, 0, sizeof(mopt));
+    sceFsInitMountSaveDataOpt(&mopt);
+    mopt.budgetid = "system";
+
+    signal(SIGPIPE, SIG_DFL);
+    int ret = sceFsMountSaveData(&mopt, image_path, GARLIC_MOUNT_POINT, decrypted);
+    signal(SIGPIPE, SIG_IGN);
+
+    if (ret >= 0) {
+        garlic_log("[Garlic] Mounted new PS4 PFS (handle=%d)\n", ret);
+        g_mounted = 1;
+        g_local_copy[0] = 0;
+        return 0;
+    }
+    garlic_log("[Garlic] Mount new PS4 PFS failed (0x%x)\n", ret);
+    return ret;
 }
 
 /* ── Mount freshly created PFS with zeroed key ─────────────────── */

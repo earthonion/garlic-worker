@@ -205,7 +205,8 @@ static int copy_mounted_to_result(const char *result_dir, const char *save_name,
 }
 
 /* ── Find save files in extracted directory ────────────────────── */
-/* PS5 saves are single files (no .bin companion). Returns count. */
+/* PS5 saves are single files. PS4 saves come as image + companion .bin
+ * (sealed key). Only return the IMAGE files (skip .bin companions). */
 static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max) {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -213,6 +214,9 @@ static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max)
     struct dirent *ent;
     while ((ent = readdir(d)) && count < max) {
         if (ent->d_name[0] == '.') continue;
+        /* Skip PS4 companion sealed-key files (handled by save_mount alongside the image) */
+        size_t nlen = strlen(ent->d_name);
+        if (nlen >= 4 && strcmp(ent->d_name + nlen - 4, ".bin") == 0) continue;
         char path[MAX_PATH_LEN];
         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
         struct stat st;
@@ -223,6 +227,32 @@ static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max)
     }
     closedir(d);
     return count;
+}
+
+/* Copy a save image to /data/save_files/<dst_name>. For PS4 saves
+ * (image header byte 0 == 0x01), also copy the companion sealed-key .bin
+ * to <data_path>.bin. Returns 0 on success, -1 on copy failure. */
+static int stage_save_to_data(const char *src_path, const char *data_path) {
+    if (copy_file(src_path, data_path) < 0) return -1;
+
+    /* If image is PS4, also stage the companion .bin */
+    int hfd = open(src_path, O_RDONLY);
+    if (hfd >= 0) {
+        uint8_t hdr = 0;
+        int n = pread(hfd, &hdr, 1, 0);
+        close(hfd);
+        if (n == 1 && hdr == 0x01) {
+            char src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
+            snprintf(src_bin, sizeof(src_bin), "%s.bin", src_path);
+            snprintf(dst_bin, sizeof(dst_bin), "%s.bin", data_path);
+            if (copy_file(src_bin, dst_bin) < 0) {
+                garlic_log("[Garlic] PS4 stage: companion .bin missing (%s)\n", src_bin);
+                return -1;
+            }
+            chmod(dst_bin, 0755);
+        }
+    }
+    return 0;
 }
 
 /* ── Job Processors ────────────────────────────────────────────── */
@@ -264,8 +294,8 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
         /* Copy to /data/ for mount */
         char data_path[MAX_PATH_LEN];
         snprintf(data_path, sizeof(data_path), "/data/save_files/_work_%s", basename);
-        if (copy_file(save_path, data_path) < 0) {
-            worker_logf(cfg, job_id, "WARNING", "Failed to copy %s", basename);
+        if (stage_save_to_data(save_path, data_path) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to stage %s", basename);
             continue;
         }
 
@@ -308,7 +338,8 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
 }
 
 static int process_encrypt(worker_config_t *cfg, const char *job_id,
-                           const char *params, const char *work_dir) {
+                           const char *params, const char *work_dir,
+                           int is_ps4_job) {
     worker_log(cfg, job_id, "INFO", "Downloading files...");
     if (worker_download_files(cfg, job_id, work_dir) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to download files");
@@ -350,21 +381,33 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         if (data_size < 32 * 1024 * 1024) data_size = 32 * 1024 * 1024;
     }
 
-    worker_logf(cfg, job_id, "INFO", "Creating PFS image (%llu bytes)...",
-                (unsigned long long)data_size);
+    worker_logf(cfg, job_id, "INFO", "Creating %s PFS image (%llu bytes)...",
+                is_ps4_job ? "PS4" : "PS5", (unsigned long long)data_size);
 
     char img_path[MAX_PATH_LEN];
     snprintf(img_path, sizeof(img_path), "/data/save_files/_work_%s", savename);
 
-    if (save_create_pfs(img_path, data_size) < 0) {
-        worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
-        return -1;
-    }
-
-    if (save_mount_new(img_path) < 0) {
-        worker_log(cfg, job_id, "ERROR", "Failed to mount new PFS");
-        unlink(img_path);
-        return -1;
+    if (is_ps4_job) {
+        if (save_create_pfs_ps4(img_path, data_size) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to create PS4 PFS image");
+            return -1;
+        }
+        if (save_mount_new_ps4(img_path) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to mount new PS4 PFS");
+            unlink(img_path);
+            char bin[MAX_PATH_LEN]; snprintf(bin, sizeof(bin), "%s.bin", img_path); unlink(bin);
+            return -1;
+        }
+    } else {
+        if (save_create_pfs(img_path, data_size) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
+            return -1;
+        }
+        if (save_mount_new(img_path) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to mount new PFS");
+            unlink(img_path);
+            return -1;
+        }
     }
 
     /* Copy files into mounted PFS */
@@ -400,6 +443,15 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, savename);
     copy_file(img_path, result_save);
     unlink(img_path);
+
+    /* PS4: include the companion sealed-key .bin in the result zip */
+    if (is_ps4_job) {
+        char src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
+        snprintf(src_bin, sizeof(src_bin), "%s.bin", img_path);
+        snprintf(dst_bin, sizeof(dst_bin), "%s.bin", result_save);
+        copy_file(src_bin, dst_bin);
+        unlink(src_bin);
+    }
 
     worker_log(cfg, job_id, "INFO", "Uploading result...");
     char result_zip[MAX_PATH_LEN];
@@ -462,8 +514,8 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
 
         char data_path[MAX_PATH_LEN];
         snprintf(data_path, sizeof(data_path), "/data/save_files/_work_%s", basename);
-        if (copy_file(save_path, data_path) < 0) {
-            worker_logf(cfg, job_id, "WARNING", "Failed to copy %s", basename);
+        if (stage_save_to_data(save_path, data_path) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to stage %s", basename);
             continue;
         }
 
@@ -492,10 +544,21 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
 
         save_unmount();
 
-        /* Copy resigned save to result */
+        /* Copy resigned save to result. For PS4 saves, the companion .bin
+         * is unchanged by resign (sealed key encodes console, not account)
+         * but must travel with the image so the user can put both back. */
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
         copy_file(data_path, result_save);
+
+        char src_bin[MAX_PATH_LEN];
+        snprintf(src_bin, sizeof(src_bin), "%s.bin", data_path);
+        if (access(src_bin, R_OK) == 0) {
+            char dst_bin[MAX_PATH_LEN];
+            snprintf(dst_bin, sizeof(dst_bin), "%s.bin", result_save);
+            copy_file(src_bin, dst_bin);
+            unlink(src_bin);
+        }
         unlink(data_path);
         processed++;
     }
@@ -624,8 +687,8 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
                     basename, i + 1, save_count);
 
         snprintf(data_path, sizeof(data_path), "/data/save_files/_work_%s", basename);
-        if (copy_file(save_path, data_path) < 0) {
-            worker_logf(cfg, job_id, "WARNING", "Failed to copy %s", basename);
+        if (stage_save_to_data(save_path, data_path) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to stage %s", basename);
             continue;
         }
 
@@ -800,22 +863,14 @@ void worker_loop(worker_config_t *cfg) {
         snprintf(work_dir, sizeof(work_dir), "%s/%.8s", WORK_BASE, job_id);
         mkdir_p(work_dir);
 
-        /* Dispatch. PS5 worker can do decrypt/resign/reregion on PS4 saves
-         * (mount path supports both formats via /dev/pfsmgr ioctl 0xc0845302),
-         * but encrypt/createsave produce PS5-format PFS images only, so we
-         * decline PS4 encrypt/createsave so HTOS can route them to a real PS4. */
+        /* Dispatch. PS5 worker handles both PS5 and PS4 jobs natively via
+         * /dev/pfsmgr (mount, decrypt + encrypt both formats). */
         int is_ps4_job = (job_platform_idx != 0); /* job came from ps4 queue */
         int result = -1;
-        if (is_ps4_job && (strcmp(operation, "encrypt") == 0 ||
-                           strcmp(operation, "createsave") == 0)) {
-            worker_logf(cfg, job_id, "ERROR",
-                "PS4 %s not supported on PS5 worker (needs PS4 PFS creation)",
-                operation);
-            result = -1;
-        } else if (strcmp(operation, "decrypt") == 0)
+        if (strcmp(operation, "decrypt") == 0)
             result = process_decrypt(cfg, job_id, params, work_dir);
         else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
-            result = process_encrypt(cfg, job_id, params, work_dir);
+            result = process_encrypt(cfg, job_id, params, work_dir, is_ps4_job);
         else if (strcmp(operation, "resign") == 0)
             result = process_resign(cfg, job_id, params, work_dir);
         else if (strcmp(operation, "reregion") == 0)
@@ -952,7 +1007,8 @@ void worker_loop_tcp(worker_config_t *cfg) {
             if (strcmp(operation, "decrypt") == 0)
                 result = process_decrypt(cfg, job_id, params, work_dir);
             else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
-                result = process_encrypt(cfg, job_id, params, work_dir);
+                /* TCP path is PS5-only (auth advertises ps5); pass is_ps4_job=0 */
+                result = process_encrypt(cfg, job_id, params, work_dir, 0);
             else if (strcmp(operation, "resign") == 0)
                 result = process_resign(cfg, job_id, params, work_dir);
             else if (strcmp(operation, "reregion") == 0)

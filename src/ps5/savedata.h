@@ -45,9 +45,20 @@ int save_unmount(void);
  * Returns 0 on success. */
 int save_create_pfs(const char *image_path, uint64_t data_size);
 
+/* Create a new PS4-format PFS image with sealed-key companion .bin.
+ * Uses /dev/pfsmgr ioctls 0x40845303 (generate) + 0xc0845302 (decrypt)
+ * and sceFsCreatePfsSaveDataImage (non-Ppr) so the image is PS4-format.
+ * Writes <image_path>.bin alongside with the 96-byte sealed key.
+ * Returns 0 on success. */
+int save_create_pfs_ps4(const char *image_path, uint64_t data_size);
+
 /* Mount a freshly created PFS image with zeroed key.
  * Returns 0 on success. */
 int save_mount_new(const char *image_path);
+
+/* Mount a freshly created PS4 PFS image (key comes from companion .bin).
+ * Returns 0 on success. */
+int save_mount_new_ps4(const char *image_path);
 
 /* Is a save currently mounted? */
 int save_is_mounted(void);
