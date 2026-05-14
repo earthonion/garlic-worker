@@ -205,8 +205,11 @@ static int copy_mounted_to_result(const char *result_dir, const char *save_name,
 }
 
 /* ── Find save files in extracted directory ────────────────────── */
-/* PS5 saves are single files. PS4 saves come as image + companion .bin
- * (sealed key). Only return the IMAGE files (skip .bin companions). */
+/* PS5 saves are single files (often named `<base>.bin` — the .bin IS the
+ * image). PS4 saves come as image + companion `<base>.bin` (sealed key,
+ * exactly 96 bytes). Only skip a `.bin` if a non-.bin sibling with the
+ * same base also exists in the same dir (true PS4 companion) — otherwise
+ * keep it (it's a standalone PS5 image). */
 static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max) {
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -214,9 +217,28 @@ static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max)
     struct dirent *ent;
     while ((ent = readdir(d)) && count < max) {
         if (ent->d_name[0] == '.') continue;
-        /* Skip PS4 companion sealed-key files (handled by save_mount alongside the image) */
+
         size_t nlen = strlen(ent->d_name);
-        if (nlen >= 4 && strcmp(ent->d_name + nlen - 4, ".bin") == 0) continue;
+        if (nlen >= 4 && strcmp(ent->d_name + nlen - 4, ".bin") == 0) {
+            /* Possible PS4 sealed-key companion: skip only if the matching
+             * non-.bin sibling also exists at the same level. */
+            char sibling[MAX_PATH_LEN];
+            int blen = (int)nlen - 4;
+            if (blen > 0 && blen < (int)sizeof(sibling)) {
+                snprintf(sibling, sizeof(sibling), "%s/%.*s", dir, blen, ent->d_name);
+                struct stat sst;
+                if (stat(sibling, &sst) == 0 && S_ISREG(sst.st_mode)) {
+                    continue;  /* PS4 companion — let save_mount handle the .bin */
+                }
+            }
+            /* Sealed-key files are exactly 96 bytes on PS4; if the .bin is
+             * tiny without a sibling, still skip it (corrupted upload). */
+            char selfpath[MAX_PATH_LEN];
+            snprintf(selfpath, sizeof(selfpath), "%s/%s", dir, ent->d_name);
+            struct stat est;
+            if (stat(selfpath, &est) == 0 && est.st_size <= 4096) continue;
+        }
+
         char path[MAX_PATH_LEN];
         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
         struct stat st;
@@ -229,6 +251,70 @@ static int find_save_files(const char *dir, char saves[][MAX_PATH_LEN], int max)
     return count;
 }
 
+/* Find the PS4 sealed-key companion for an image. Real PS4 naming has
+ * different basenames (image=`sdimg_<savename>`, key=`<savename>.bin`),
+ * and HTOS may rename the image, so we can't assume <image>.bin. Strategy:
+ *   1. Try <image>.bin (same-base — works for some uploads)
+ *   2. Try stripping `sdimg_` from image stem + .bin (real PS4 hw)
+ *   3. Fall back to scanning the dir for any small (<=4KB) .bin file,
+ *      preferring one whose stem is a suffix of the image stem.
+ * Returns 0 + writes path to `out` on success, -1 if none found. */
+static int find_ps4_companion_bin(const char *image_path, char *out, size_t out_sz) {
+    /* Step 1: <image>.bin */
+    snprintf(out, out_sz, "%s.bin", image_path);
+    if (access(out, R_OK) == 0) return 0;
+
+    /* Decompose into dir + basename */
+    char dir[MAX_PATH_LEN], base[MAX_PATH_LEN];
+    strncpy(dir, image_path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    char *sl = strrchr(dir, '/');
+    if (sl) { *sl = 0; strncpy(base, sl + 1, sizeof(base) - 1); base[sizeof(base) - 1] = 0; }
+    else { strncpy(base, dir, sizeof(base) - 1); base[sizeof(base) - 1] = 0; dir[0] = '.'; dir[1] = 0; }
+
+    /* Step 2: strip sdimg_ prefix if present (real PS4 naming) */
+    const char *stem = base;
+    if (strncmp(stem, "sdimg_", 6) == 0) stem += 6;
+    if (stem != base) {
+        snprintf(out, out_sz, "%s/%s.bin", dir, stem);
+        if (access(out, R_OK) == 0) return 0;
+    }
+
+    /* Step 3: scan dir for any small .bin (<=4KB; PS4 sealed key is 96 bytes).
+     * Prefer one whose stem is a suffix of the image stem. */
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *e;
+    char fallback[MAX_PATH_LEN] = {0};
+    while ((e = readdir(d))) {
+        size_t nl = strlen(e->d_name);
+        if (nl < 5 || strcmp(e->d_name + nl - 4, ".bin") != 0) continue;
+        char full[MAX_PATH_LEN];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (st.st_size == 0 || st.st_size > 4096) continue;
+
+        /* Prefer matches: stem of this .bin is a suffix of image's stem */
+        char bin_stem[MAX_PATH_LEN];
+        snprintf(bin_stem, sizeof(bin_stem), "%.*s", (int)(nl - 4), e->d_name);
+        size_t bs = strlen(bin_stem), is = strlen(stem);
+        if (bs <= is && strcmp(stem + is - bs, bin_stem) == 0) {
+            snprintf(out, out_sz, "%s", full);
+            closedir(d);
+            return 0;
+        }
+        /* Otherwise remember this as a fallback */
+        if (!fallback[0]) snprintf(fallback, sizeof(fallback), "%s", full);
+    }
+    closedir(d);
+    if (fallback[0]) {
+        snprintf(out, out_sz, "%s", fallback);
+        return 0;
+    }
+    return -1;
+}
+
 /* Copy a save image to /data/save_files/<dst_name>. For PS4 saves
  * (image header byte 0 == 0x01), also copy the companion sealed-key .bin
  * to <data_path>.bin. Returns 0 on success, -1 on copy failure. */
@@ -237,21 +323,28 @@ static int stage_save_to_data(const char *src_path, const char *data_path) {
 
     /* If image is PS4, also stage the companion .bin */
     int hfd = open(src_path, O_RDONLY);
-    if (hfd >= 0) {
-        uint8_t hdr = 0;
-        int n = pread(hfd, &hdr, 1, 0);
-        close(hfd);
-        if (n == 1 && hdr == 0x01) {
-            char src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
-            snprintf(src_bin, sizeof(src_bin), "%s.bin", src_path);
-            snprintf(dst_bin, sizeof(dst_bin), "%s.bin", data_path);
-            if (copy_file(src_bin, dst_bin) < 0) {
-                garlic_log("[Garlic] PS4 stage: companion .bin missing (%s)\n", src_bin);
-                return -1;
-            }
-            chmod(dst_bin, 0755);
-        }
+    if (hfd < 0) {
+        garlic_log("[Garlic] PS4 stage: cannot re-open %s (errno %d)\n", src_path, errno);
+        return -1;
     }
+    uint8_t hdr = 0;
+    int n = pread(hfd, &hdr, 1, 0);
+    close(hfd);
+    if (n != 1 || hdr != 0x01) return 0;  /* not PS4 — image-only is fine */
+
+    char src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
+    if (find_ps4_companion_bin(src_path, src_bin, sizeof(src_bin)) < 0) {
+        garlic_log("[Garlic] PS4 stage: no companion .bin found in dir of %s\n", src_path);
+        return -1;
+    }
+    snprintf(dst_bin, sizeof(dst_bin), "%s.bin", data_path);
+    if (copy_file(src_bin, dst_bin) < 0) {
+        garlic_log("[Garlic] PS4 stage: copy %s -> %s failed (errno %d)\n",
+                   src_bin, dst_bin, errno);
+        return -1;
+    }
+    chmod(dst_bin, 0755);
+    garlic_log("[Garlic] PS4 stage: copied sealed key %s -> %s\n", src_bin, dst_bin);
     return 0;
 }
 
@@ -281,6 +374,28 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
         worker_log(cfg, job_id, "ERROR", "No save files found");
         return -1;
     }
+    {
+        /* Log what we picked up so users can see if a file got dropped */
+        DIR *_d = opendir(files_dir);
+        if (_d) {
+            char picked[1024] = {0}, all[1024] = {0};
+            struct dirent *e;
+            for (int i = 0; i < save_count && strlen(picked) < sizeof(picked) - 64; i++) {
+                const char *b = strrchr(saves[i], '/');
+                b = b ? b + 1 : saves[i];
+                snprintf(picked + strlen(picked), sizeof(picked) - strlen(picked),
+                         "%s%s", picked[0] ? "," : "", b);
+            }
+            while ((e = readdir(_d)) && strlen(all) < sizeof(all) - 64) {
+                if (e->d_name[0] == '.') continue;
+                snprintf(all + strlen(all), sizeof(all) - strlen(all),
+                         "%s%s", all[0] ? "," : "", e->d_name);
+            }
+            closedir(_d);
+            worker_logf(cfg, job_id, "INFO",
+                "Files: [%s], mounting: [%s]", all, picked);
+        }
+    }
 
     int processed = 0;
     for (int i = 0; i < save_count; i++) {
@@ -304,7 +419,8 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             if (mret == SAVE_ERR_CORRUPTED)
                 worker_log(cfg, job_id, "ERROR", "Corrupted save! Is your FTP server set to binary mode?");
             else
-                worker_logf(cfg, job_id, "WARNING", "Failed to mount %s", basename);
+                worker_logf(cfg, job_id, "WARNING",
+                            "Failed to mount %s (rc=%d)", basename, mret);
             unlink(data_path);
             continue;
         }
