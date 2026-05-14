@@ -734,10 +734,20 @@ void worker_loop(worker_config_t *cfg) {
 
     int jobs_since_cleanup = 0;
 
+    /* Poll PS5 jobs first, then PS4 jobs. The PS5 worker can now process
+     * both formats natively via /dev/pfsmgr ioctl 0xc0845302 (PS5 keys
+     * embedded in image at 0x800; PS4 keys read from companion .bin file). */
+    static const char *poll_paths[] = {
+        "/api/worker/next?platform=ps5",
+        "/api/worker/next?platform=ps4",
+    };
+    int next_platform_idx = 0;
+
     while (1) {
         http_response_t resp;
+        const char *poll_path = poll_paths[next_platform_idx];
         int rc = http_get(cfg->server_host, cfg->server_port,
-                          "/api/worker/next?platform=ps5", cfg->worker_key, &resp);
+                          poll_path, cfg->worker_key, &resp);
 
         if (rc < 0) {
             garlic_log("[Garlic] Server unreachable, retrying in %ds\n", cfg->poll_interval);
@@ -745,17 +755,27 @@ void worker_loop(worker_config_t *cfg) {
             continue;
         }
 
-        if (resp.status == 204) {
-            /* No jobs available */
-            sleep(cfg->poll_interval);
+        if (resp.status == 204 || resp.status == 404) {
+            /* No jobs for this platform — try the other platform on next tick.
+             * Sleep only after we've polled BOTH and gotten nothing. */
+            next_platform_idx = (next_platform_idx + 1) % 2;
+            if (next_platform_idx == 0) sleep(cfg->poll_interval);
             continue;
         }
 
         if (resp.status != 200) {
-            garlic_log("[Garlic] Unexpected status %d from /next\n", resp.status);
-            sleep(cfg->poll_interval);
+            garlic_log("[Garlic] Unexpected status %d from /next (%s)\n",
+                       resp.status, poll_path);
+            next_platform_idx = (next_platform_idx + 1) % 2;
+            if (next_platform_idx == 0) sleep(cfg->poll_interval);
             continue;
         }
+
+        /* Got a job — remember which platform queue it came from, then reset
+         * rotation so the next poll prefers PS5 again. */
+        int job_platform_idx = next_platform_idx;
+        garlic_log("[Garlic] Got job from %s\n", poll_path);
+        next_platform_idx = 0;
 
         /* Parse job */
         char job_id[64] = {0}, operation[32] = {0}, params[8192] = {0};
@@ -780,9 +800,19 @@ void worker_loop(worker_config_t *cfg) {
         snprintf(work_dir, sizeof(work_dir), "%s/%.8s", WORK_BASE, job_id);
         mkdir_p(work_dir);
 
-        /* Dispatch */
+        /* Dispatch. PS5 worker can do decrypt/resign/reregion on PS4 saves
+         * (mount path supports both formats via /dev/pfsmgr ioctl 0xc0845302),
+         * but encrypt/createsave produce PS5-format PFS images only, so we
+         * decline PS4 encrypt/createsave so HTOS can route them to a real PS4. */
+        int is_ps4_job = (job_platform_idx != 0); /* job came from ps4 queue */
         int result = -1;
-        if (strcmp(operation, "decrypt") == 0)
+        if (is_ps4_job && (strcmp(operation, "encrypt") == 0 ||
+                           strcmp(operation, "createsave") == 0)) {
+            worker_logf(cfg, job_id, "ERROR",
+                "PS4 %s not supported on PS5 worker (needs PS4 PFS creation)",
+                operation);
+            result = -1;
+        } else if (strcmp(operation, "decrypt") == 0)
             result = process_decrypt(cfg, job_id, params, work_dir);
         else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
             result = process_encrypt(cfg, job_id, params, work_dir);

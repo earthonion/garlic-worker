@@ -42,13 +42,38 @@ void savedata_init(void) {
     mkdir("/data/save_files", 0777);
 }
 
-/* ── Mount existing save ───────────────────────────────────────── */
+/* ── Detect PS4 vs PS5 by image header byte 0 (0x01=PS4, 0x02=PS5) ── */
+static int detect_is_ps4(const char *image_path) {
+    int hfd = open(image_path, O_RDONLY);
+    if (hfd < 0) return -1;
+    uint8_t hdr = 0;
+    int n = pread(hfd, &hdr, 1, 0);
+    close(hfd);
+    if (n != 1) return -1;
+    return (hdr == 0x01) ? 1 : 0;
+}
+
+/* ── Mount existing save (PS4 + PS5) ──────────────────────────────
+ * PS5 images: sealed key magic `pfsSKKey` embedded at offset 0x800.
+ * PS4 images (sdimg_*): sealed key in companion .bin file (savename.bin).
+ * Both decrypted via /dev/pfsmgr ioctl 0xc0845302.
+ */
 int save_mount(const char *save_path) {
     if (g_mounted) save_unmount();
 
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
 
-    /* If save is NOT on /data/, copy there first (mount from other paths causes EPIPE) */
+    int is_ps4 = detect_is_ps4(save_path);
+    if (is_ps4 < 0) {
+        garlic_log("[Garlic] Cannot read save header: %s\n", save_path);
+        return -2;
+    }
+    garlic_log("[Garlic] %s detected as %s\n",
+               strrchr(save_path, '/') ? strrchr(save_path, '/') + 1 : save_path,
+               is_ps4 ? "PS4" : "PS5");
+
+    /* If save is NOT on /data/, copy there first (mount from other paths causes EPIPE).
+     * For PS4 saves we also need to copy the companion .bin (sealed key). */
     const char *mount_src = save_path;
     g_local_copy[0] = 0;
     int is_on_data = (strncmp(save_path, "/data/", 6) == 0);
@@ -64,9 +89,27 @@ int save_mount(const char *save_path) {
         }
         chmod(g_local_copy, 0755);
         mount_src = g_local_copy;
+
+        /* PS4: also copy companion .bin (sealed key) into /data/save_files/ */
+        if (is_ps4 && strncmp(basename, "sdimg_", 6) == 0) {
+            const char *savename = basename + 6;
+            char src_dir[MAX_PATH_LEN], src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
+            strncpy(src_dir, save_path, sizeof(src_dir) - 1);
+            src_dir[sizeof(src_dir) - 1] = 0;
+            char *sl = strrchr(src_dir, '/');
+            if (sl) *(sl + 1) = 0; else src_dir[0] = 0;
+            snprintf(src_bin, sizeof(src_bin), "%s%s.bin", src_dir, savename);
+            snprintf(dst_bin, sizeof(dst_bin), "/data/save_files/%s.bin", savename);
+            if (copy_file(src_bin, dst_bin) < 0) {
+                garlic_log("[Garlic] PS4: companion .bin missing at %s (errno %d)\n",
+                           src_bin, errno);
+                return -2;
+            }
+            chmod(dst_bin, 0755);
+            garlic_log("[Garlic] PS4: copied sealed key %s -> %s\n", src_bin, dst_bin);
+        }
     }
 
-    /* Find and read sealed key (search for pfsSKKey magic near 0x800) */
     /* Heap-allocate ioctl buffer — ioctl may corrupt stack beyond buffer bounds */
     struct {
         uint8_t key[0x60];
@@ -76,48 +119,84 @@ int save_mount(const char *save_path) {
     if (!pfsbuf) return -2;
     memset(pfsbuf, 0, sizeof(*pfsbuf));
 
-    garlic_log("[Garlic] Opening %s for sealed key read\n", mount_src);
-    int fd = open(mount_src, O_RDONLY);
-    if (fd < 0) {
-        garlic_log("[Garlic] Cannot open %s (errno %d)\n", mount_src, errno);
-        free(pfsbuf);
-        return -2;
-    }
-    struct stat st;
-    fstat(fd, &st);
-    garlic_log("[Garlic] File size: %lld\n", (long long)st.st_size);
-
-    /* Read wider region and search for pfsSKKey magic */
-    uint8_t keybuf[0x80];
-    int ret = pread(fd, keybuf, sizeof(keybuf), 0x800);
-    close(fd);
-    if (ret < 0x60) {
-        garlic_log("[Garlic] Failed to read key region (ret=%d)\n", ret);
-        free(pfsbuf);
-        return -3;
-    }
-
-    /* Find pfsSKKey magic (8 bytes: 70 66 73 53 4b 4b 65 79) */
-    static const uint8_t magic[] = {'p','f','s','S','K','K','e','y'};
-    int key_off = -1;
-    for (int i = 0; i <= ret - 0x60; i++) {
-        if (memcmp(keybuf + i, magic, 8) == 0) {
-            key_off = i;
-            break;
+    int ret;
+    if (is_ps4) {
+        /* PS4: read 0x60 sealed-key bytes from companion .bin */
+        const char *bname = strrchr(mount_src, '/');
+        bname = bname ? bname + 1 : mount_src;
+        if (strncmp(bname, "sdimg_", 6) != 0) {
+            garlic_log("[Garlic] PS4 save expected to be 'sdimg_*' (got %s)\n", bname);
+            free(pfsbuf);
+            return -3;
         }
+        const char *savename = bname + 6;
+        char dir[MAX_PATH_LEN], bin_path[MAX_PATH_LEN];
+        strncpy(dir, mount_src, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) *(slash + 1) = 0; else dir[0] = 0;
+        snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, savename);
+
+        garlic_log("[Garlic] Opening PS4 sealed key %s\n", bin_path);
+        int fd = open(bin_path, O_RDONLY);
+        if (fd < 0) {
+            garlic_log("[Garlic] Cannot open .bin %s (errno %d)\n", bin_path, errno);
+            free(pfsbuf);
+            return -2;
+        }
+        ret = read(fd, pfsbuf->key, 0x60);
+        close(fd);
+        if (ret != 0x60) {
+            garlic_log("[Garlic] Short read on .bin (got %d / 0x60)\n", ret);
+            free(pfsbuf);
+            return -3;
+        }
+        garlic_log("[Garlic] PS4 sealed key loaded (keyset=%d)\n",
+                   (pfsbuf->key[9] << 8) | pfsbuf->key[8]);
+    } else {
+        /* PS5: read sealed key from offset 0x800 in image, scan for pfsSKKey magic */
+        garlic_log("[Garlic] Opening %s for sealed key read\n", mount_src);
+        int fd = open(mount_src, O_RDONLY);
+        if (fd < 0) {
+            garlic_log("[Garlic] Cannot open %s (errno %d)\n", mount_src, errno);
+            free(pfsbuf);
+            return -2;
+        }
+        struct stat st;
+        fstat(fd, &st);
+        garlic_log("[Garlic] File size: %lld\n", (long long)st.st_size);
+
+        uint8_t keybuf[0x80];
+        ret = pread(fd, keybuf, sizeof(keybuf), 0x800);
+        close(fd);
+        if (ret < 0x60) {
+            garlic_log("[Garlic] Failed to read key region (ret=%d)\n", ret);
+            free(pfsbuf);
+            return -3;
+        }
+
+        /* Find pfsSKKey magic (8 bytes: 70 66 73 53 4b 4b 65 79) */
+        static const uint8_t magic[] = {'p','f','s','S','K','K','e','y'};
+        int key_off = -1;
+        for (int i = 0; i <= ret - 0x60; i++) {
+            if (memcmp(keybuf + i, magic, 8) == 0) {
+                key_off = i;
+                break;
+            }
+        }
+        if (key_off < 0) {
+            garlic_log("[Garlic] pfsSKKey magic not found — save file is corrupted\n");
+            free(pfsbuf);
+            return -3;
+        }
+        if (key_off != 0) {
+            garlic_log("[Garlic] Corrupted save! pfsSKKey at 0x%x instead of 0x800. "
+                       "Is your FTP server set to transfer in binary mode?\n", 0x800 + key_off);
+            free(pfsbuf);
+            return SAVE_ERR_CORRUPTED;
+        }
+        memcpy(pfsbuf->key, keybuf, 0x60);
     }
-    if (key_off < 0) {
-        garlic_log("[Garlic] pfsSKKey magic not found — save file is corrupted\n");
-        free(pfsbuf);
-        return -3;
-    }
-    if (key_off != 0) {
-        garlic_log("[Garlic] Corrupted save! pfsSKKey at 0x%x instead of 0x800. "
-                   "Is your FTP server set to transfer in binary mode?\n", 0x800 + key_off);
-        free(pfsbuf);
-        return SAVE_ERR_CORRUPTED;
-    }
-    memcpy(pfsbuf->key, keybuf, 0x60);
 
     int pfsmgr = open("/dev/pfsmgr", 2);
     if (pfsmgr < 0) {
