@@ -23,6 +23,17 @@
 #define SFO_AID_OFFSET     0x1B8  /* default: PS5 param.sfo */
 #define SFO_AID_OFFSET_PS5 0x1B8
 #define SFO_AID_OFFSET_PS4 0x15C
+
+/* PS4/PS5 SFO stores ACCOUNT_ID as uint64 LITTLE-ENDIAN (see HTOS
+ * services/orbis.py: ACCOUNT_ID: uint64(0, "little")). hex_to_bytes()
+ * produces bytes in the order they appear in the hex string (BE notation),
+ * so we must reverse before writing to match the SFO format. v1.1.2 and
+ * below wrote BE bytes here, which silently corrupted SFO metadata. */
+static void pwrite_sfo_account_id(int fd, const uint8_t aid_be[8], int offset) {
+    uint8_t le[8];
+    for (int i = 0; i < 8; i++) le[i] = aid_be[7 - i];
+    pwrite(fd, le, 8, (off_t)offset);
+}
 #define KEYSTONE_SIZE  0x400
 
 /* ── Transport mode (0=HTTP, 1=TCP) ────────────────────────────── */
@@ -545,7 +556,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
             int sfo_fd = open(sfo_path, O_RDWR);
             if (sfo_fd >= 0) {
-                pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
+                pwrite_sfo_account_id(sfo_fd, new_aid, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
                 close(sfo_fd);
                 sync();
                 worker_log(cfg, job_id, "INFO", "Patched account ID");
@@ -657,7 +668,7 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
                  save_get_mount_point());
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
+            pwrite_sfo_account_id(sfo_fd, new_aid, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
             close(sfo_fd);
             sync();
         } else {
@@ -832,7 +843,7 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
+            pwrite_sfo_account_id(sfo_fd, new_aid, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
             close(sfo_fd);
         }
 
