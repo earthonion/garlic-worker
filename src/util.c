@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/types.h>
 
 #include "util.h"
 
@@ -33,7 +34,7 @@ void delete_recursive(const char *path) {
 int copy_file(const char *src, const char *dst) {
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) return -1;
-    int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0777);
     if (dfd < 0) { close(sfd); return -2; }
     char buf[BUF_SIZE];
     ssize_t n;
@@ -46,16 +47,21 @@ int copy_file(const char *src, const char *dst) {
         }
     }
     fsync(dfd);
+    /* Force mode 0777 regardless of umask — the game verifies save file mode
+     * and flags 0775 (world-write stripped by default umask=022) as corrupt. */
+    fchmod(dfd, 0777);
     close(sfd);
     close(dfd);
     return 0;
 }
 
 int copy_dir_recursive(const char *src, const char *dst) {
+    umask(0);
     mkdir(dst, 0777);
     DIR *d = opendir(src);
     if (!d) return -1;
 
+    int rc = 0;
     struct dirent *ent;
     while ((ent = readdir(d))) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
@@ -64,14 +70,18 @@ int copy_dir_recursive(const char *src, const char *dst) {
         snprintf(dp, sizeof(dp), "%s/%s", dst, ent->d_name);
         struct stat st;
         if (stat(sp, &st) < 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            copy_dir_recursive(sp, dp);
-        } else {
-            copy_file(sp, dp);
+        int r;
+        if (S_ISDIR(st.st_mode)) r = copy_dir_recursive(sp, dp);
+        else                     r = copy_file(sp, dp);
+        if (r < 0) {
+            fprintf(stderr, "[copy_dir_recursive] %s -> %s failed (rc=%d errno=%d)\n",
+                    sp, dp, r, errno);
+            rc = r;
+            break;
         }
     }
     closedir(d);
-    return 0;
+    return rc;
 }
 
 int mkdir_p(const char *path) {
@@ -118,13 +128,21 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
 
         struct stat st;
         if (stat(sp, &st) < 0) continue;
+        int r;
         if (S_ISDIR(st.st_mode)) {
-            _copy_pfs_recursive(sp, dp, src_base);
+            r = _copy_pfs_recursive(sp, dp, src_base);
         } else {
             /* Create file first (like cecie.nim does) */
             int fd = open(dp, O_CREAT | O_TRUNC, 0777);
             if (fd >= 0) close(fd);
-            copy_file(sp, dp);
+            r = copy_file(sp, dp);
+        }
+        if (r < 0) {
+            fprintf(stderr, "[_copy_pfs_recursive] %s -> %s failed (rc=%d errno=%d)\n",
+                    sp, dp, r, errno);
+            closedir(d);
+            setuid(0);
+            return r;
         }
     }
     closedir(d);
@@ -133,6 +151,10 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
 }
 
 int copy_dir_pfs(const char *src, const char *dst) {
+    /* Umask 0 so 0777 mkdir/open modes come through un-masked.  Default
+     * process umask 022/002 strips world-write from files, producing 0775
+     * dir/file modes that the game rejects as corrupt savedata. */
+    umask(0);
     return _copy_pfs_recursive(src, dst, src);
 }
 
