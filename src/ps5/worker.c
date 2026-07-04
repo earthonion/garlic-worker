@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/stat.h>
 
 #include "worker.h"
@@ -16,6 +17,85 @@
 #include "savedata.h"
 #include "util.h"
 #include "log.h"
+
+/* Which platform tag to send when asking /api/worker/update for our
+ * replacement.  PS5 build handles both PS5-native and PS4 saves, so it
+ * pulls the PS5 ELF. */
+#define WORKER_PLATFORM "ps5"
+#define UPDATE_TMP_PATH "/data/garlic-worker-update.elf"
+
+/* Forward decl */
+static void worker_self_update(worker_config_t *cfg);
+
+/* Download the latest garlic-worker ELF from the server, pipe it into the
+ * local elfldr on 127.0.0.1:9021, then SIGKILL ourselves. If any step
+ * fails we log and return so the caller can back off and retry.
+ *
+ * The server-side gate returns HTTP 426 to any worker below
+ * MIN_WORKER_VERSION; that's what triggers this path. */
+static void worker_self_update(worker_config_t *cfg) {
+    garlic_log("[Garlic] self_update: downloading /api/worker/update?platform=%s\n",
+               WORKER_PLATFORM);
+
+    char update_path[64];
+    snprintf(update_path, sizeof(update_path),
+             "/api/worker/update?platform=%s", WORKER_PLATFORM);
+
+    unlink(UPDATE_TMP_PATH);
+    int rc = http_download_to_file(cfg->server_host, cfg->server_port,
+                                    update_path, cfg->worker_key,
+                                    UPDATE_TMP_PATH);
+    if (rc != 200) {
+        garlic_log("[Garlic] self_update: download failed (rc=%d)\n", rc);
+        return;
+    }
+
+    struct stat st;
+    if (stat(UPDATE_TMP_PATH, &st) < 0 || st.st_size < 4096) {
+        garlic_log("[Garlic] self_update: downloaded ELF too small (%lld)\n",
+                   (long long)st.st_size);
+        return;
+    }
+    garlic_log("[Garlic] self_update: got %lld bytes, piping to elfldr\n",
+               (long long)st.st_size);
+
+    int sfd = http_tcp_connect("127.0.0.1", 9021);
+    if (sfd < 0) {
+        garlic_log("[Garlic] self_update: cannot connect to local elfldr\n");
+        return;
+    }
+    int ffd = open(UPDATE_TMP_PATH, O_RDONLY);
+    if (ffd < 0) {
+        garlic_log("[Garlic] self_update: cannot re-open %s\n", UPDATE_TMP_PATH);
+        close(sfd);
+        return;
+    }
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(ffd, buf, sizeof(buf))) > 0) {
+        ssize_t w = 0;
+        while (w < n) {
+            ssize_t r = write(sfd, buf + w, n - w);
+            if (r <= 0) {
+                garlic_log("[Garlic] self_update: short write to elfldr\n");
+                close(ffd); close(sfd);
+                return;
+            }
+            w += r;
+        }
+    }
+    close(ffd);
+    close(sfd);
+    unlink(UPDATE_TMP_PATH);
+
+    /* Give elfldr a moment to spawn the replacement so it can bind to
+     * anything we release on exit. */
+    garlic_log("[Garlic] self_update: ELF sent, exiting old worker in 3s\n");
+    log_flush();
+    sleep(3);
+    kill(getpid(), SIGKILL);
+    /* unreached */
+}
 
 #define WORK_BASE      "/data/garlic/work"
 /* PS4 and PS5 save files use different param.sfo key tables, so the
@@ -531,10 +611,16 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
     }
 
-    /* Copy files into mounted PFS */
+    /* Copy files into mounted PFS. Fail loudly if any file copy errors:
+     * silent ENOSPC in the middle of copy_dir_recursive was the source of
+     * the "encrypt appears to succeed but decrypt is missing files" bug. */
     worker_log(cfg, job_id, "INFO", "Copying files into PFS...");
     const char *mnt = save_get_mount_point();
-    copy_dir_recursive(files_dir, mnt);
+    if (copy_dir_recursive(files_dir, mnt) < 0) {
+        worker_log(cfg, job_id, "ERROR", "Failed to copy files into PFS (out of space?)");
+        save_unmount();
+        return -1;
+    }
     sync();
 
     /* Patch account ID if provided */
@@ -946,6 +1032,19 @@ void worker_loop(worker_config_t *cfg) {
              * Sleep only after we've polled BOTH and gotten nothing. */
             next_platform_idx = (next_platform_idx + 1) % 2;
             if (next_platform_idx == 0) sleep(cfg->poll_interval);
+            continue;
+        }
+
+        if (resp.status == 426) {
+            /* Server says we're below MIN_WORKER_VERSION. Self-update:
+             * download the latest ELF from /api/worker/update, pipe it into
+             * local elfldr on 127.0.0.1:9021, then SIGKILL ourselves. The
+             * new binary elfldr just loaded takes over from here. */
+            garlic_log("[Garlic] Server rejected worker as outdated (426). "
+                       "Body: %.200s\n", resp.body);
+            worker_self_update(cfg);
+            /* If self_update returned we couldn't update; back off and retry */
+            sleep(cfg->poll_interval * 4);
             continue;
         }
 
