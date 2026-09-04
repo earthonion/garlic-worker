@@ -11,6 +11,7 @@ int  copy_file(const char *src, const char *dst);
 int  copy_dir_recursive(const char *src, const char *dst);
 int  copy_dir_pfs(const char *src, const char *dst);
 int  mkdir_p(const char *path);
+uint64_t count_entries_recursive(const char *dir);
 int  hex_to_bytes(const char *hex, uint8_t *out, int max_bytes);
 uint64_t hex_to_u64(const char *hex);
 

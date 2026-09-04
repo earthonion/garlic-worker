@@ -469,6 +469,24 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     }
     sync();
 
+    /* Verify entry count — the PS4 kernel silently drops directory entries
+     * past a per-container ceiling (observed at ~1369 files/dir with the
+     * default block size) without an errno; write() returns 0 but the
+     * name doesn't stick. Count both trees and fail loudly on mismatch. */
+    {
+        uint64_t s_src = count_entries_recursive(files_dir);
+        uint64_t s_dst = count_entries_recursive(mnt);
+        if (s_dst != s_src) {
+            worker_logf(cfg, job_id, "ERROR",
+                        "PFS truncated %llu entries (uploaded %llu, on disk %llu). "
+                        "Container is too small for this many files — raise saveblocks or split the save.",
+                        (unsigned long long)(s_src - s_dst),
+                        (unsigned long long)s_src, (unsigned long long)s_dst);
+            save_unmount();
+            return -1;
+        }
+    }
+
     /* Patch account ID if provided */
     if (account_id[0]) {
         uint8_t new_aid[8];

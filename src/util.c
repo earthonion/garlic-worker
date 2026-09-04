@@ -176,3 +176,25 @@ uint64_t hex_to_u64(const char *hex) {
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
     return strtoull(s, NULL, 16);
 }
+
+/* Recursively count files + subdirs under `dir`. Used to verify that a
+ * PFS copy landed all entries — Sony's PS5 kernel silently drops
+ * directory entries past a per-container ceiling without failing the
+ * write() call, so counting after copy is the only way to catch it. */
+uint64_t count_entries_recursive(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    uint64_t n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        n++;
+        char p[MAX_PATH_LEN];
+        snprintf(p, sizeof(p), "%s/%s", dir, ent->d_name);
+        struct stat st;
+        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode))
+            n += count_entries_recursive(p);
+    }
+    closedir(d);
+    return n;
+}
