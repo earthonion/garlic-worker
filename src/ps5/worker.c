@@ -8,6 +8,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/ioctl.h>
+#include <ps5/kernel.h>
 
 #include "worker.h"
 #include "http.h"
@@ -434,6 +437,106 @@ static int stage_save_to_data(const char *src_path, const char *data_path) {
 }
 
 /* ── Job Processors ────────────────────────────────────────────── */
+
+static pid_t ncdt_find_pid(const char *name) {
+    int mib[4] = {1, 14, 8, 0};
+    size_t size;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0)) return -1;
+    unsigned char *buf = malloc(size);
+    if (sysctl(mib, 4, buf, &size, NULL, 0)) {
+        free(buf);
+        return -1;
+    }
+    pid_t pid = -1;
+    for (unsigned char *p = buf; p < buf + size;) {
+        int len = *(int *)p;
+        if (len <= 0) break;
+        if (!strcmp((char *)(p + 447), name)) {
+            pid = *(pid_t *)(p + 72);
+            break;
+        }
+        p += len;
+    }
+    free(buf);
+    return pid;
+}
+
+static int process_ppr_derive(worker_config_t *cfg, const char *job_id,
+                              const char *params, const char *work_dir) {
+    char client_hex[33] = {0}, server_hex[33] = {0};
+    json_get_string(params, "client_value", client_hex, sizeof(client_hex));
+    json_get_string(params, "server_value", server_hex, sizeof(server_hex));
+
+    uint8_t request[0x4c] = {0};
+    if (strlen(client_hex) != 32 || strlen(server_hex) != 32 ||
+        hex_to_bytes(client_hex, request, 16) != 16 ||
+        hex_to_bytes(server_hex, request + 16, 16) != 16) {
+        worker_log(cfg, job_id, "ERROR", "client_value and server_value must be 16 bytes of hex");
+        return -1;
+    }
+
+    pid_t shellcore = ncdt_find_pid("SceShellCore");
+    pid_t self = getpid();
+    if (shellcore < 0) {
+        worker_log(cfg, job_id, "ERROR", "SceShellCore not found");
+        return -1;
+    }
+    uint8_t caps[16], attrs[32];
+    uint64_t authid = kernel_get_ucred_authid(shellcore);
+    kernel_get_ucred_caps(shellcore, caps);
+    kernel_get_ucred_attrs(shellcore, attrs);
+    kernel_set_ucred_authid(self, authid);
+    kernel_set_ucred_caps(self, caps);
+    kernel_set_ucred_attrs(self, attrs);
+
+    int device = open("/dev/ncdt", O_RDWR);
+    if (device < 0) {
+        worker_log(cfg, job_id, "ERROR", "Cannot open /dev/ncdt");
+        return -1;
+    }
+    int result = ioctl(device, 0xc04c4e03, request);
+    uint32_t status = *(uint32_t *)(request + 0x48);
+    close(device);
+    if (result != 0 || status != 0) {
+        worker_logf(cfg, job_id, "ERROR", "PPR ioctl failed: result=%d status=0x%x", result, status);
+        return -1;
+    }
+
+    char result_dir[MAX_PATH_LEN];
+    snprintf(result_dir, sizeof(result_dir), "%s/result", work_dir);
+    mkdir(result_dir, 0777);
+    char json_path[MAX_PATH_LEN];
+    snprintf(json_path, sizeof(json_path), "%s/ppr.json", result_dir);
+    int fd = open(json_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        worker_log(cfg, job_id, "ERROR", "Cannot create PPR result");
+        return -1;
+    }
+    char output[512];
+    int output_len = snprintf(output, sizeof(output),
+        "{\"key1\":\"%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\","
+        "\"key2\":\"%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\","
+        "\"nonce1\":\"%02x%02x%02x%02x\",\"nonce2\":\"%02x%02x%02x%02x\"}\n",
+        request[0x20], request[0x21], request[0x22], request[0x23],
+        request[0x24], request[0x25], request[0x26], request[0x27],
+        request[0x28], request[0x29], request[0x2a], request[0x2b],
+        request[0x2c], request[0x2d], request[0x2e], request[0x2f],
+        request[0x30], request[0x31], request[0x32], request[0x33],
+        request[0x34], request[0x35], request[0x36], request[0x37],
+        request[0x38], request[0x39], request[0x3a], request[0x3b],
+        request[0x3c], request[0x3d], request[0x3e], request[0x3f],
+        request[0x40], request[0x41], request[0x42], request[0x43],
+        request[0x44], request[0x45], request[0x46], request[0x47]);
+    write(fd, output, output_len);
+    close(fd);
+
+    if (worker_upload_result(cfg, job_id, json_path) < 0) {
+        worker_log(cfg, job_id, "ERROR", "Failed to upload PPR result");
+        return -1;
+    }
+    worker_log(cfg, job_id, "INFO", "PPR derivation complete");
+    return 0;
+}
 
 static int process_decrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir) {
@@ -1107,7 +1210,9 @@ void worker_loop(worker_config_t *cfg) {
          * /dev/pfsmgr (mount, decrypt + encrypt both formats). */
         int is_ps4_job = (job_platform_idx != 0); /* job came from ps4 queue */
         int result = -1;
-        if (strcmp(operation, "decrypt") == 0)
+        if (strcmp(operation, "ppr_derive") == 0)
+            result = process_ppr_derive(cfg, job_id, params, work_dir);
+        else if (strcmp(operation, "decrypt") == 0)
             result = process_decrypt(cfg, job_id, params, work_dir);
         else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
             result = process_encrypt(cfg, job_id, params, work_dir, is_ps4_job);
@@ -1244,7 +1349,9 @@ void worker_loop_tcp(worker_config_t *cfg) {
             mkdir_p(work_dir);
 
             int result = -1;
-            if (strcmp(operation, "decrypt") == 0)
+            if (strcmp(operation, "ppr_derive") == 0)
+                result = process_ppr_derive(cfg, job_id, params, work_dir);
+            else if (strcmp(operation, "decrypt") == 0)
                 result = process_decrypt(cfg, job_id, params, work_dir);
             else if (strcmp(operation, "encrypt") == 0 || strcmp(operation, "createsave") == 0)
                 /* TCP path is PS5-only (auth advertises ps5); pass is_ps4_job=0 */
