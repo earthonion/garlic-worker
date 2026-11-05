@@ -262,10 +262,8 @@ int save_unmount(void) {
 int save_create_pfs(const char *image_path, uint64_t data_size) {
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
 
-    /* Size: data + 25% overhead + 4MB, min 32MB, aligned to 32K */
+    /* Size: data + 25% overhead + 4MB, aligned to 32K */
     uint64_t img_size = data_size + (data_size / 4) + (4 * 1024 * 1024);
-    if (img_size < 32 * 1024 * 1024)
-        img_size = 32 * 1024 * 1024;
     img_size = ((img_size + 32767) / 32768) * 32768;
 
     /* Create file and allocate space */

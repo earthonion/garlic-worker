@@ -671,9 +671,12 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         saveblocks = sfo_read_savedata_blocks(sfo_path);
     }
 
-    /* Estimate data size from file sizes (heuristic floor) */
-    uint64_t data_size = 0;
-    {
+    uint64_t data_size;
+    if (saveblocks > 0) {
+        data_size = (uint64_t)saveblocks * 32768;
+    } else {
+        /* No SAVEDATA_BLOCKS — estimate from file sizes */
+        data_size = 0;
         DIR *d = opendir(files_dir);
         if (d) {
             struct dirent *ent;
@@ -687,11 +690,6 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             closedir(d);
         }
         if (data_size < 32 * 1024 * 1024) data_size = 32 * 1024 * 1024;
-    }
-    /* Use SAVEDATA_BLOCKS as the floor for the final image size */
-    if (saveblocks > 0) {
-        uint64_t blocks_size = (uint64_t)saveblocks * 32768;
-        if (blocks_size > data_size) data_size = blocks_size;
     }
 
     worker_logf(cfg, job_id, "INFO", "Creating %s PFS image (%llu bytes)...",
