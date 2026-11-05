@@ -602,6 +602,10 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
+        /* PS5: capture real param.sfo from encrypted header blob before mount */
+        if (!detect_is_ps4(data_path))
+            ps5param_capture_for_image(data_path);
+
         int mret = save_mount(data_path);
         if (mret < 0) {
             if (mret == SAVE_ERR_CORRUPTED)
@@ -611,6 +615,17 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                             "Failed to mount %s (rc=%d)", basename, mret);
             unlink(data_path);
             continue;
+        }
+
+        /* PS5: install real SFO from blob into the mounted PFS so decrypted
+         * output contains actual metadata instead of zeroed placeholder */
+        if (ps5param_get_cached_sfo_len()) {
+            char sfo_path[MAX_PATH_LEN];
+            snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
+                     save_get_mount_point());
+            install_sfo_file(sfo_path, ps5param_get_cached_sfo(),
+                             ps5param_get_cached_sfo_len());
+            sync();
         }
 
         copy_mounted_to_result(result_dir, basename, include_sce_sys);
@@ -767,7 +782,33 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
     }
 
+    /* PS5: capture the final SFO (with any account patch) for the blob */
+    uint8_t enc_sfo[0x8000];
+    uint32_t enc_sfo_len = 0;
+    if (!is_ps4_job) {
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
+        int rfd = open(sfo_path, O_RDONLY);
+        if (rfd >= 0) {
+            ssize_t rn = read(rfd, enc_sfo, sizeof(enc_sfo));
+            close(rfd);
+            if (rn > 0 && sfo_bytes_valid(enc_sfo, (size_t)rn))
+                enc_sfo_len = (uint32_t)rn;
+        }
+    }
+
     save_unmount();
+
+    /* PS5: write real param.sfo into the encrypted header blob */
+    if (enc_sfo_len) {
+        int wr = ps5param_write_sfo(img_path, enc_sfo, enc_sfo_len);
+        if (wr < 0)
+            worker_logf(cfg, job_id, "WARNING",
+                        "PS5PARAM blob write failed (%d); SFO remains in PFS only", wr);
+        else
+            worker_logf(cfg, job_id, "INFO",
+                        "PS5PARAM: wrote param.sfo (%u B) into image blob", enc_sfo_len);
+    }
 
     /* Copy result to result dir and zip */
     char result_dir[MAX_PATH_LEN];
@@ -855,6 +896,11 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
+        /* PS5: capture real SFO from blob before mount */
+        int is_ps4_save = detect_is_ps4(data_path);
+        if (is_ps4_save <= 0)
+            ps5param_capture_for_image(data_path);
+
         int mret = save_mount(data_path);
         if (mret < 0) {
             if (mret == SAVE_ERR_CORRUPTED)
@@ -865,10 +911,17 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        /* Patch account ID */
+        /* PS5: install real SFO into PFS so we patch the actual metadata */
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
                  save_get_mount_point());
+        if (ps5param_get_cached_sfo_len()) {
+            install_sfo_file(sfo_path, ps5param_get_cached_sfo(),
+                             ps5param_get_cached_sfo_len());
+            sync();
+        }
+
+        /* Patch account ID */
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd >= 0) {
             pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
@@ -878,7 +931,31 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
             worker_logf(cfg, job_id, "WARNING", "Cannot open param.sfo for %s", basename);
         }
 
+        /* PS5: read back the patched SFO for the blob write-back */
+        uint8_t resign_sfo[0x8000];
+        uint32_t resign_sfo_len = 0;
+        if (is_ps4_save <= 0 && ps5param_get_cached_sfo_len()) {
+            int rfd = open(sfo_path, O_RDONLY);
+            if (rfd >= 0) {
+                ssize_t rn = read(rfd, resign_sfo, sizeof(resign_sfo));
+                close(rfd);
+                if (rn > 0 && sfo_bytes_valid(resign_sfo, (size_t)rn))
+                    resign_sfo_len = (uint32_t)rn;
+            }
+        }
+
         save_unmount();
+
+        /* PS5: write the resigned SFO back into the header blob */
+        if (resign_sfo_len) {
+            int wr = ps5param_write_sfo(data_path, resign_sfo, resign_sfo_len);
+            if (wr < 0)
+                worker_logf(cfg, job_id, "WARNING",
+                            "PS5PARAM blob write failed (%d); patched SFO in PFS only", wr);
+            else
+                worker_logf(cfg, job_id, "INFO",
+                            "PS5PARAM: wrote resigned param.sfo (%u B) into blob", resign_sfo_len);
+        }
 
         /* Copy resigned save to result. For PS4 saves, the companion .bin
          * is unchanged by resign (sealed key encodes console, not account)
@@ -1029,6 +1106,11 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
+        /* PS5: capture real SFO from blob before mount */
+        int is_ps4_save = detect_is_ps4(data_path);
+        if (is_ps4_save <= 0)
+            ps5param_capture_for_image(data_path);
+
         int mret = save_mount(data_path);
         if (mret < 0) {
             if (mret == SAVE_ERR_CORRUPTED)
@@ -1041,9 +1123,15 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
 
         const char *mnt = save_get_mount_point();
 
-        /* Patch account ID */
+        /* PS5: install real SFO into PFS */
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
+        if (ps5param_get_cached_sfo_len()) {
+            install_sfo_file(sfo_path, ps5param_get_cached_sfo(),
+                             ps5param_get_cached_sfo_len());
+        }
+
+        /* Patch account ID */
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd >= 0) {
             pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
@@ -1060,7 +1148,28 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
         }
         sync();
 
+        /* PS5: capture patched SFO for blob write-back */
+        uint8_t rereg_sfo[0x8000];
+        uint32_t rereg_sfo_len = 0;
+        if (is_ps4_save <= 0 && ps5param_get_cached_sfo_len()) {
+            int rfd = open(sfo_path, O_RDONLY);
+            if (rfd >= 0) {
+                ssize_t rn = read(rfd, rereg_sfo, sizeof(rereg_sfo));
+                close(rfd);
+                if (rn > 0 && sfo_bytes_valid(rereg_sfo, (size_t)rn))
+                    rereg_sfo_len = (uint32_t)rn;
+            }
+        }
+
         save_unmount();
+
+        /* PS5: write patched SFO back to blob */
+        if (rereg_sfo_len) {
+            int wr = ps5param_write_sfo(data_path, rereg_sfo, rereg_sfo_len);
+            if (wr < 0)
+                worker_logf(cfg, job_id, "WARNING",
+                            "PS5PARAM blob write failed (%d)", wr);
+        }
 
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
