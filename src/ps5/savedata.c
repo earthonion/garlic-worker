@@ -259,12 +259,16 @@ int save_unmount(void) {
 }
 
 /* ── Create new PFS image ──────────────────────────────────────── */
-int save_create_pfs(const char *image_path, uint64_t data_size) {
+int save_create_pfs(const char *image_path, uint64_t size, int exact) {
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
 
-    /* Size: data + 25% overhead + 4MB, aligned to 32K */
-    uint64_t img_size = data_size + (data_size / 4) + (4 * 1024 * 1024);
-    img_size = ((img_size + 32767) / 32768) * 32768;
+    uint64_t img_size;
+    if (exact) {
+        img_size = ((size + 32767) / 32768) * 32768;
+    } else {
+        img_size = size + (size / 4) + (4 * 1024 * 1024);
+        img_size = ((img_size + 32767) / 32768) * 32768;
+    }
 
     /* Create file and allocate space */
     int fd = open(image_path, O_CREAT | O_TRUNC | O_RDWR, 0777);

@@ -40,10 +40,11 @@ int save_mount(const char *save_path);
 /* Unmount current save. Returns 0 on success. */
 int save_unmount(void);
 
-/* Create a new PFS image file with the given data capacity.
- * The actual file will be larger (overhead + alignment).
+/* Create a new PFS image file.
+ * exact=1: size is the final image size (from SAVEDATA_BLOCKS).
+ * exact=0: size is estimated data; overhead + alignment added.
  * Returns 0 on success. */
-int save_create_pfs(const char *image_path, uint64_t data_size);
+int save_create_pfs(const char *image_path, uint64_t size, int exact);
 
 /* Create a new PS4-format PFS image with sealed-key companion .bin.
  * Uses /dev/pfsmgr ioctls 0x40845303 (generate) + 0xc0845302 (decrypt)
