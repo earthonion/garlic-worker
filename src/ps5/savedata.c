@@ -275,7 +275,7 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
         return -1;
     }
 
-    int ret = sceFsUfsAllocateSaveData(fd, img_size, 0, 0);
+    int ret = sceFsUfsAllocateSaveData(fd, img_size, 0x80, 0);
     if (ret < 0) {
         garlic_log("[Garlic] UfsAllocate failed (0x%x), using ftruncate\n", ret);
         if (ftruncate(fd, img_size) < 0) {
@@ -287,7 +287,7 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
     close(fd);
     garlic_log("[Garlic] Created image %llu bytes\n", (unsigned long long)img_size);
 
-    /* Format as PFS with compression */
+    /* Format as PFS */
     if (!g_pprCreate) {
         garlic_log("[Garlic] PprCreate not available\n");
         unlink(image_path);
@@ -297,7 +297,6 @@ int save_create_pfs(const char *image_path, uint64_t data_size) {
     CreateOpt copt;
     memset(&copt, 0, sizeof(copt));
     sceFsInitCreatePfsSaveDataOpt(&copt);
-    copt.flags[1] = 0x02; /* compression */
     uint8_t ckey[0x20] = {0};
 
     ret = g_pprCreate(&copt, image_path, 0, img_size, ckey);
