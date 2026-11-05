@@ -69,4 +69,7 @@ const char *save_get_mount_point(void);
 /* Periodic cleanup: force unmount, delete temp files in /data/save_files/ */
 void save_periodic_cleanup(void);
 
+/* Read SAVEDATA_BLOCKS from a param.sfo file. Returns 0 if not found. */
+int sfo_read_savedata_blocks(const char *sfo_path);
+
 #endif

@@ -538,3 +538,36 @@ void save_periodic_cleanup(void) {
 
     garlic_log("[Garlic] Periodic cleanup done\n");
 }
+
+int sfo_read_savedata_blocks(const char *sfo_path) {
+    int fd = open(sfo_path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t hdr[20];
+    if (read(fd, hdr, 20) != 20 ||
+        hdr[0] != 0x00 || hdr[1] != 0x50 || hdr[2] != 0x53 || hdr[3] != 0x46) {
+        close(fd);
+        return 0;
+    }
+    uint32_t key_off, data_off, count;
+    memcpy(&key_off, hdr + 8, 4);
+    memcpy(&data_off, hdr + 12, 4);
+    memcpy(&count, hdr + 16, 4);
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t entry[16];
+        if (pread(fd, entry, 16, 20 + i * 16) != 16) break;
+        uint16_t k_off;
+        memcpy(&k_off, entry, 2);
+        uint32_t d_off;
+        memcpy(&d_off, entry + 12, 4);
+        char key[32] = {0};
+        if (pread(fd, key, sizeof(key) - 1, key_off + k_off) <= 0) continue;
+        if (strcmp(key, "SAVEDATA_BLOCKS") == 0) {
+            uint32_t blocks = 0;
+            pread(fd, &blocks, 4, data_off + d_off);
+            close(fd);
+            return (int)blocks;
+        }
+    }
+    close(fd);
+    return 0;
+}
