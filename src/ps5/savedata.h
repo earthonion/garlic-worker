@@ -21,6 +21,8 @@ int sceFsUmountSaveData(UmountOpt *opt, const char *mount, int handle, int ignor
 int sceFsInitCreatePfsSaveDataOpt(CreateOpt *opt);
 int sceFsCreatePfsSaveDataImage(CreateOpt *opt, const char *path, int x, uint64_t size, uint8_t *key);
 int sceFsUfsAllocateSaveData(int fd, uint64_t size, uint64_t flags, int ext);
+int sceFsTransactionSaveDataReadParam(const char *path, void *buf, uint32_t size);
+int sceFsTransactionSaveDataWriteParam(const char *path, const void *buf, uint32_t size);
 
 /* ── Mount point ───────────────────────────────────────────────── */
 #define GARLIC_MOUNT_POINT "/data/garlic_mnt"
@@ -59,7 +61,7 @@ int save_create_pfs_ps4(const char *image_path, uint64_t data_size);
 
 /* Mount a freshly created PFS image with zeroed key.
  * Returns 0 on success. */
-int save_mount_new(const char *image_path);
+int save_mount_new(const char *image_path, const uint8_t *key);
 
 /* Mount a freshly created PS4 PFS image (key comes from companion .bin).
  * Returns 0 on success. */
@@ -87,12 +89,15 @@ void ps5param_capture_for_image(const char *image_path);
  * Returns SFO size > 0, 0 = no blob, < 0 = error. */
 int ps5param_read_sfo(const char *image_path, uint8_t *sfo, uint32_t sfomax);
 
-/* Write an SFO into the image's PS5PARAM blob (encrypts via /dev/pfsctl).
+/* Write an SFO into the image's PS5PARAM blob (uses the native FS transaction API).
  * Returns 0 on success, < 0 on error. */
 int ps5param_write_sfo(const char *image_path, const uint8_t *sfo, uint32_t sz);
 
 /* Validate SFO header magic and table bounds. Returns 1 if valid, 0 otherwise. */
 int sfo_bytes_valid(const uint8_t *buf, size_t size);
+int sfo_all_zero_file(const char *path);
+int ps5param_export_blob(const char *image_path, const char *dest);
+int ps5param_restore_blob(const char *image_path, const char *sidecar);
 
 /* Write an SFO buffer to a file path (restores real SFO into mounted PFS). */
 int install_sfo_file(const char *path, const uint8_t *buf, uint32_t len);

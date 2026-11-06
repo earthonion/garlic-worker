@@ -489,7 +489,7 @@ int save_mount_new_ps4(const char *image_path) {
 }
 
 /* ── Mount freshly created PFS with zeroed key ─────────────────── */
-int save_mount_new(const char *image_path) {
+int save_mount_new(const char *image_path, const uint8_t *key) {
     if (g_mounted) save_unmount();
 
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
@@ -500,6 +500,7 @@ int save_mount_new(const char *image_path) {
     mopt.budgetid = "system";
 
     uint8_t ckey[0x20] = {0};
+    if (key) memcpy(ckey, key, sizeof(ckey));
 
     signal(SIGPIPE, SIG_DFL);
     int ret = sceFsMountSaveData(&mopt, image_path, GARLIC_MOUNT_POINT, ckey);
@@ -548,22 +549,9 @@ void save_periodic_cleanup(void) {
 /* ── PS5PARAM blob I/O ─────────────────────────────────────────────
  * PS5 (ppr) saves keep the real param.sfo in an encrypted 0x8000-byte blob
  * in the image header at 0xC00.  The kernel exposes the blob through
- * /dev/pfsctl, which decrypts it with the save's sealed key via SBL.
+ * sceFsTransactionSaveDataReadParam/WriteParam, which handles its encryption.
  * Blob layout: 'PS5PARAM' u64 | u32 ver=0 | u32 sfo_size | u32 sfo_off=20 | SFO
  */
-#define PFSCTL_PARAM_READ    0xC0189111u
-#define PFSCTL_PARAM_WRITE   0x80189112u
-#define PFSCTL_PARAM_READ2   0xC0209116u
-#define PFSCTL_PARAM_WRITE2  0x80209118u
-
-typedef struct {
-    const char *path;
-    void *buf;
-    uint32_t size;
-    uint32_t pad;
-    uint64_t *out;
-} pfs_param_arg_t;
-
 static void ps5param_elevate(void) {
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
     uint8_t caps[16];
@@ -571,88 +559,6 @@ static void ps5param_elevate(void) {
     caps[7] |= 0x40;
     kernel_set_ucred_caps(getpid(), caps);
     setuid(0);
-}
-
-static const char *g_param_devs[] = {
-    "/dev/pfsctl", "/dev/pfsmgr", "/dev/devpfs.ctl", "/dev/pfs", "/dev/pfsctldev", NULL
-};
-static int g_param_dev_idx = -1;
-static int g_param_scanned = 0;
-
-static void ps5param_scan_dev(void) {
-    if (g_param_scanned) return;
-    g_param_scanned = 1;
-    DIR *d = opendir("/dev");
-    if (!d) return;
-    struct dirent *e;
-    char line[768]; line[0] = 0;
-    size_t len = 0;
-    while ((e = readdir(d)) != NULL) {
-        if (!strstr(e->d_name, "pfs") && !strstr(e->d_name, "PFS")) continue;
-        int n = snprintf(line + len, sizeof(line) - len, " %s", e->d_name);
-        if (n < 0 || (size_t)n >= sizeof(line) - len) break;
-        len += (size_t)n;
-    }
-    closedir(d);
-    garlic_log("[Garlic] PS5PARAM: /dev pfs nodes:%s\n", len ? line : " (none)");
-}
-
-static int ps5param_blob_magic_ok(const uint8_t *blob) {
-    uint64_t m;
-    memcpy(&m, blob, 8);
-    return m == 0x4D41524150355350ULL; /* "PS5PARAM" LE */
-}
-
-static int ps5param_ioctl(const char *img, uint8_t *blob, uint32_t size, int wr) {
-    ps5param_scan_dev();
-    unsigned cmds[2];
-    if (wr) { cmds[0] = PFSCTL_PARAM_WRITE;  cmds[1] = PFSCTL_PARAM_WRITE2; }
-    else    { cmds[0] = PFSCTL_PARAM_READ;   cmds[1] = PFSCTL_PARAM_READ2; }
-
-    int soft_ok = 0, last_errno = 0, any_open = 0;
-    int ndev = 0;
-    while (g_param_devs[ndev]) ndev++;
-
-    for (int k = 0; k < ndev; k++) {
-        int di = (g_param_dev_idx >= 0) ? ((g_param_dev_idx + k) % ndev) : k;
-        int fd = open(g_param_devs[di], O_RDONLY);
-        if (fd < 0 && errno == EACCES)
-            fd = open(g_param_devs[di], O_RDWR);
-        if (fd < 0) {
-            if (!last_errno) last_errno = errno;
-            continue;
-        }
-        any_open = 1;
-        for (int ci = 0; ci < 2; ci++) {
-            unsigned cmd = cmds[ci];
-            uint64_t out = 0;
-            pfs_param_arg_t a;
-            memset(&a, 0, sizeof(a));
-            a.path = img; a.buf = blob; a.size = size; a.out = &out;
-            if (!wr) memset(blob, 0, size);
-            errno = 0;
-            int r = ioctl(fd, cmd, &a);
-            int ie = errno;
-            garlic_log("[Garlic] PS5PARAM: %s %s cmd=%08x ret=%d errno=%d\n",
-                       g_param_devs[di], wr ? "write" : "read", cmd, r, r < 0 ? ie : 0);
-            if (r < 0) { last_errno = ie ? ie : EIO; continue; }
-            if (wr) {
-                close(fd);
-                g_param_dev_idx = di;
-                return 0;
-            }
-            if (ps5param_blob_magic_ok(blob)) {
-                close(fd);
-                g_param_dev_idx = di;
-                return 0;
-            }
-            soft_ok = 1;
-        }
-        close(fd);
-    }
-    if (soft_ok) { memset(blob, 0, size); return 0; }
-    if (!any_open) garlic_log("[Garlic] PS5PARAM: no /dev node could be opened\n");
-    return -(last_errno ? last_errno : EIO);
 }
 
 static int ps5param_enable_blob_mode(const char *img, uint64_t *saved) {
@@ -686,7 +592,7 @@ int ps5param_read_sfo(const char *img, uint8_t *sfo, uint32_t sfomax) {
     static uint8_t blob[0x8000];
     memset(blob, 0, sizeof(blob));
     ps5param_elevate();
-    int r = ps5param_ioctl(img, blob, sizeof(blob), 0);
+    int r = sceFsTransactionSaveDataReadParam(img, blob, sizeof(blob));
     if (r < 0) return r;
 
     uint64_t magic;
@@ -719,45 +625,20 @@ int ps5param_write_sfo(const char *img, const uint8_t *sfo, uint32_t sz) {
     memcpy(blob + 20, sfo, sz);
 
     ps5param_elevate();
-    int r = ps5param_ioctl(img, blob, sizeof(blob), 1);
+    int r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
     if (r < 0) {
         uint64_t saved = 0;
         int en = ps5param_enable_blob_mode(img, &saved);
         if (en == 1) {
             garlic_log("[Garlic] PS5PARAM: retrying blob write after enabling mode\n");
-            r = ps5param_ioctl(img, blob, sizeof(blob), 1);
-        }
-        if (r < 0) {
-            /* pwrite blob to disk first, then retry ioctl — if the ioctl
-             * succeeds this time it regenerates the ICV */
-            garlic_log("[Garlic] PS5PARAM: writing blob to file, retrying ioctl for ICV\n");
-            int fd = open(img, O_RDWR);
-            if (fd >= 0) {
-                pwrite(fd, blob, sizeof(blob), 0xC00);
-                fsync(fd);
-                close(fd);
-                r = ps5param_ioctl(img, blob, sizeof(blob), 1);
-            }
+            r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
             if (r < 0) {
-                garlic_log("[Garlic] PS5PARAM: ioctl still fails, rolling back header\n");
-                fd = open(img, O_RDWR);
+                int fd = open(img, O_RDWR);
                 if (fd >= 0) {
                     pwrite(fd, &saved, 8, 0x368);
-                    static uint8_t zbuf[0x8000];
-                    memset(zbuf, 0, sizeof(zbuf));
-                    pwrite(fd, zbuf, sizeof(zbuf), 0xC00);
-                    fsync(fd);
                     close(fd);
                 }
             }
-        }
-    }
-    if (r == 0) {
-        int fd = open(img, O_RDWR);
-        if (fd >= 0) {
-            pwrite(fd, blob, sizeof(blob), 0xC00);
-            fsync(fd);
-            close(fd);
         }
     }
     return r;
@@ -775,6 +656,57 @@ void ps5param_capture_for_image(const char *img) {
     } else if (r < 0) {
         garlic_log("[Garlic] PS5PARAM: no blob read (%d)\n", r);
     }
+}
+
+int sfo_all_zero_file(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t buf[4096];
+    ssize_t nr;
+    int zero = 1;
+    while ((nr = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < nr; i++) {
+            if (buf[i]) { zero = 0; break; }
+        }
+        if (!zero) break;
+    }
+    close(fd);
+    return zero;
+}
+
+int ps5param_export_blob(const char *img, const char *dest) {
+    static uint8_t blob[0x8000];
+    int sfd = open(img, O_RDONLY);
+    if (sfd < 0) return -1;
+    ssize_t nr = pread(sfd, blob, sizeof(blob), 0xC00);
+    close(sfd);
+    if (nr != (ssize_t)sizeof(blob)) return -1;
+    int nonzero = 0;
+    for (size_t i = 0; i < sizeof(blob); i++) {
+        if (blob[i]) { nonzero = 1; break; }
+    }
+    if (!nonzero) return -2;
+    int dfd = open(dest, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (dfd < 0) return -1;
+    ssize_t nw = write(dfd, blob, sizeof(blob));
+    fsync(dfd);
+    close(dfd);
+    return nw == (ssize_t)sizeof(blob) ? 0 : -1;
+}
+
+int ps5param_restore_blob(const char *img, const char *sidecar) {
+    static uint8_t blob[0x8000];
+    int sfd = open(sidecar, O_RDONLY);
+    if (sfd < 0) return -1;
+    ssize_t nr = read(sfd, blob, sizeof(blob));
+    close(sfd);
+    if (nr != (ssize_t)sizeof(blob)) return -1;
+    int dfd = open(img, O_RDWR);
+    if (dfd < 0) return -1;
+    ssize_t nw = pwrite(dfd, blob, sizeof(blob), 0xC00);
+    fsync(dfd);
+    close(dfd);
+    return nw == (ssize_t)sizeof(blob) ? 0 : -1;
 }
 
 int sfo_bytes_valid(const uint8_t *buf, size_t size) {

@@ -555,8 +555,8 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
     snprintf(result_dir, sizeof(result_dir), "%s/result", work_dir);
     mkdir(result_dir, 0777);
 
-    /* Find save files */
-    char saves[64][MAX_PATH_LEN];
+    /* Find save files without exhausting the worker thread's stack. */
+    static char saves[64][MAX_PATH_LEN];
     int save_count = find_save_files(files_dir, saves, 64);
     if (save_count == 0) {
         worker_log(cfg, job_id, "ERROR", "No save files found");
@@ -617,18 +617,56 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        /* PS5: install real SFO from blob into the mounted PFS so decrypted
-         * output contains actual metadata instead of zeroed placeholder */
-        if (ps5param_get_cached_sfo_len()) {
-            char sfo_path[MAX_PATH_LEN];
-            snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
-                     save_get_mount_point());
-            install_sfo_file(sfo_path, ps5param_get_cached_sfo(),
-                             ps5param_get_cached_sfo_len());
-            sync();
+        char sidecar[MAX_PATH_LEN];
+        snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", result_dir);
+        if (ps5param_export_blob(data_path, sidecar) < 0) {
+            worker_logf(cfg, job_id, "WARNING",
+                        "No original PS5PARAM blob for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            continue;
+        }
+        struct stat image_st;
+        if (stat(data_path, &image_st) == 0) {
+            char size_path[MAX_PATH_LEN];
+            snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", result_dir);
+            int sfd = open(size_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (sfd >= 0) {
+                char size_text[32];
+                int size_len = snprintf(size_text, sizeof(size_text), "%llu",
+                                        (unsigned long long)image_st.st_size);
+                write(sfd, size_text, size_len);
+                close(sfd);
+            }
         }
 
+        uint8_t key_data[0x100] = {0};
+        int key_image = open(data_path, O_RDONLY);
+        if (key_image >= 0 && pread(key_image, key_data, 0x60, 0x800) == 0x60) {
+            int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+            if (pfsmgr >= 0) {
+                if (ioctl(pfsmgr, 0xc0845302, key_data) >= 0) {
+                    char key_path[MAX_PATH_LEN];
+                    snprintf(key_path, sizeof(key_path), "%s/PS5KEY", result_dir);
+                    int out = open(key_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                    if (out >= 0) {
+                        write(out, key_data + 0x60, 0x20);
+                        close(out);
+                    }
+                }
+                close(pfsmgr);
+            }
+        }
+        if (key_image >= 0) close(key_image);
         copy_mounted_to_result(result_dir, basename, include_sce_sys);
+        char original_image[MAX_PATH_LEN];
+        snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", result_dir);
+        if (copy_file(data_path, original_image) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to preserve original PFS image");
+            save_unmount();
+            unlink(data_path);
+            return -1;
+        }
         save_unmount();
         unlink(data_path);
         processed++;
@@ -707,40 +745,111 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         if (data_size < 32 * 1024 * 1024) data_size = 32 * 1024 * 1024;
     }
 
-    worker_logf(cfg, job_id, "INFO", "Creating %s PFS image (%llu bytes)...",
-                is_ps4_job ? "PS4" : "PS5", (unsigned long long)data_size);
-
     char img_path[MAX_PATH_LEN];
     snprintf(img_path, sizeof(img_path), "/data/save_files/_work_%s", savename);
+    uint8_t original_key[0x20] = {0};
+    int has_original_key = 0;
+    {
+        char key_path[MAX_PATH_LEN];
+        snprintf(key_path, sizeof(key_path), "%s/PS5KEY", files_dir);
+        int kfd = open(key_path, O_RDONLY);
+        if (kfd >= 0) {
+            ssize_t nr = read(kfd, original_key, sizeof(original_key));
+            close(kfd);
+            has_original_key = nr == (ssize_t)sizeof(original_key);
+        }
+        unlink(key_path);
+    }
 
-    if (is_ps4_job) {
-        if (save_create_pfs_ps4(img_path, data_size) < 0) {
-            worker_log(cfg, job_id, "ERROR", "Failed to create PS4 PFS image");
-            return -1;
+    int preserve_sidecar = 0;
+    char sidecar[MAX_PATH_LEN];
+    snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", files_dir);
+    char saved_sidecar[MAX_PATH_LEN];
+    snprintf(saved_sidecar, sizeof(saved_sidecar), "%s/PS5PARAM.sidecar", work_dir);
+    struct stat sidecar_st;
+    int has_sidecar = stat(sidecar, &sidecar_st) == 0 && sidecar_st.st_size == 0x8000;
+    if (has_sidecar && !has_original_key) {
+        worker_log(cfg, job_id, "ERROR", "PS5PARAM preservation requires the original PS5KEY");
+        return -1;
+    }
+    uint64_t original_size = 0;
+    if (has_sidecar) {
+        char size_path[MAX_PATH_LEN];
+        snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", files_dir);
+        int sfd = open(size_path, O_RDONLY);
+        if (sfd >= 0) {
+            char size_text[32] = {0};
+            ssize_t nr = read(sfd, size_text, sizeof(size_text) - 1);
+            close(sfd);
+            if (nr > 0) original_size = strtoull(size_text, NULL, 10);
         }
-        if (save_mount_new_ps4(img_path) < 0) {
-            worker_log(cfg, job_id, "ERROR", "Failed to mount new PS4 PFS");
+        if (original_size >= 0x10000 && original_size <= (1ULL << 40))
+            data_size = original_size;
+        unlink(size_path);
+    }
+
+    char original_image[MAX_PATH_LEN];
+    snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", files_dir);
+    struct stat original_st;
+    int use_original = !is_ps4_job && has_sidecar && original_size > 0 &&
+        stat(original_image, &original_st) == 0 &&
+        (uint64_t)original_st.st_size == original_size;
+
+    if (use_original) {
+        worker_log(cfg, job_id, "INFO", "Reusing original PS5 PFS image...");
+        if (copy_file(original_image, img_path) < 0 ||
+            save_mount_new(img_path, original_key) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to mount original PFS image");
             unlink(img_path);
-            char bin[MAX_PATH_LEN]; snprintf(bin, sizeof(bin), "%s.bin", img_path); unlink(bin);
             return -1;
         }
+        ps5param_capture_for_image(img_path);
     } else {
-        if (save_create_pfs(img_path, data_size, saveblocks > 0) < 0) {
-            worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
-            return -1;
-        }
-        if (save_mount_new(img_path) < 0) {
-            worker_log(cfg, job_id, "ERROR", "Failed to mount new PFS");
-            unlink(img_path);
-            return -1;
+        worker_logf(cfg, job_id, "INFO", "Creating %s PFS image (%llu bytes)...",
+                    is_ps4_job ? "PS4" : "PS5", (unsigned long long)data_size);
+        if (is_ps4_job) {
+            if (save_create_pfs_ps4(img_path, data_size) < 0) {
+                worker_log(cfg, job_id, "ERROR", "Failed to create PS4 PFS image");
+                return -1;
+            }
+            if (save_mount_new_ps4(img_path) < 0) {
+                worker_log(cfg, job_id, "ERROR", "Failed to mount new PS4 PFS");
+                unlink(img_path);
+                char bin[MAX_PATH_LEN]; snprintf(bin, sizeof(bin), "%s.bin", img_path); unlink(bin);
+                return -1;
+            }
+        } else {
+            if (save_create_pfs(img_path, data_size, saveblocks > 0) < 0) {
+                worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
+                return -1;
+            }
+            if (save_mount_new(img_path, original_key) < 0) {
+                worker_log(cfg, job_id, "ERROR", "Failed to mount new PFS");
+                unlink(img_path);
+                return -1;
+            }
         }
     }
+    unlink(original_image);
 
     /* Copy files into mounted PFS. Fail loudly if any file copy errors:
      * silent ENOSPC in the middle of copy_dir_recursive was the source of
      * the "encrypt appears to succeed but decrypt is missing files" bug. */
     worker_log(cfg, job_id, "INFO", "Copying files into PFS...");
     const char *mnt = save_get_mount_point();
+    if (has_sidecar && rename(sidecar, saved_sidecar) < 0) {
+        save_unmount();
+        return -1;
+    }
+    char uploaded_sfo[MAX_PATH_LEN];
+    snprintf(uploaded_sfo, sizeof(uploaded_sfo), "%s/sce_sys/param.sfo", files_dir);
+    int upload_zero_sfo = sfo_all_zero_file(uploaded_sfo);
+    if (upload_zero_sfo && !has_sidecar) {
+        worker_log(cfg, job_id, "ERROR", "Zeroed param.sfo requires its original PS5PARAM blob");
+        save_unmount();
+        return -1;
+    }
+    preserve_sidecar = has_sidecar && original_size > 0;
     if (copy_dir_recursive(files_dir, mnt) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to copy files into PFS (out of space?)");
         save_unmount();
@@ -766,8 +875,9 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
     }
 
+    if (account_id[0] && !upload_zero_sfo) preserve_sidecar = 0;
     /* Patch account ID if provided */
-    if (account_id[0]) {
+    if (account_id[0] && !preserve_sidecar) {
         uint8_t new_aid[8];
         if (hex_to_bytes(account_id, new_aid, 8) == 8) {
             char sfo_path[MAX_PATH_LEN];
@@ -799,8 +909,15 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     save_unmount();
 
-    /* PS5: write real param.sfo into the encrypted header blob */
-    if (enc_sfo_len) {
+    if (preserve_sidecar) {
+        if (ps5param_restore_blob(img_path, saved_sidecar) < 0) {
+            unlink(saved_sidecar);
+            worker_log(cfg, job_id, "ERROR", "Failed to restore original PS5PARAM blob");
+            return -1;
+        }
+        unlink(saved_sidecar);
+        worker_log(cfg, job_id, "INFO", "PS5PARAM: restored original encrypted blob for zeroed param.sfo");
+    } else if (enc_sfo_len) {
         int wr = ps5param_write_sfo(img_path, enc_sfo, enc_sfo_len);
         if (wr < 0)
             worker_logf(cfg, job_id, "WARNING",
@@ -808,6 +925,8 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         else
             worker_logf(cfg, job_id, "INFO",
                         "PS5PARAM: wrote param.sfo (%u B) into image blob", enc_sfo_len);
+    } else {
+        unlink(saved_sidecar);
     }
 
     /* Copy result to result dir and zip */
@@ -911,14 +1030,13 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        /* PS5: install real SFO into PFS so we patch the actual metadata */
+        /* Resigning updates the real metadata and writes a new PS5PARAM blob. */
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
                  save_get_mount_point());
         if (ps5param_get_cached_sfo_len()) {
             install_sfo_file(sfo_path, ps5param_get_cached_sfo(),
                              ps5param_get_cached_sfo_len());
-            sync();
         }
 
         /* Patch account ID */
