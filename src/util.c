@@ -186,20 +186,32 @@ uint64_t hex_to_u64(const char *hex) {
  * PFS copy landed all entries — Sony's PS5 kernel silently drops
  * directory entries past a per-container ceiling without failing the
  * write() call, so counting after copy is the only way to catch it. */
-uint64_t count_entries_recursive(const char *dir) {
+static uint64_t _count_pfs_recursive(const char *dir, const char *base,
+                                      int preserve_sce_sys) {
     DIR *d = opendir(dir);
     if (!d) return 0;
     uint64_t n = 0;
     struct dirent *ent;
     while ((ent = readdir(d))) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-        n++;
         char p[MAX_PATH_LEN];
         snprintf(p, sizeof(p), "%s/%s", dir, ent->d_name);
+        const char *relpath = p + strlen(base);
+        if (*relpath == '/') relpath++;
+        if (preserve_sce_sys && _is_sce_sys_path(relpath)) continue;
+        n++;
         struct stat st;
         if (stat(p, &st) == 0 && S_ISDIR(st.st_mode))
-            n += count_entries_recursive(p);
+            n += _count_pfs_recursive(p, base, preserve_sce_sys);
     }
     closedir(d);
     return n;
+}
+
+uint64_t count_entries_recursive(const char *dir) {
+    return _count_pfs_recursive(dir, dir, 0);
+}
+
+uint64_t count_entries_pfs_preserve_sce_sys(const char *dir) {
+    return _count_pfs_recursive(dir, dir, 1);
 }

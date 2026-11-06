@@ -181,6 +181,11 @@ static void worker_set_status(worker_config_t *cfg, const char *job_id,
     }
 }
 
+static int is_ps5_sidecar(const char *name) {
+    return strcmp(name, "PS5PARAM") == 0 || strcmp(name, "PS5PARAM_SIZE") == 0 ||
+           strcmp(name, "PS5KEY") == 0 || strcmp(name, "PS5IMAGE") == 0;
+}
+
 static int flatten_single_save_directory(const char *files_dir) {
     DIR *root = opendir(files_dir);
     if (!root) return -1;
@@ -188,7 +193,7 @@ static int flatten_single_save_directory(const char *files_dir) {
     int entries = 0;
     struct dirent *ent;
     while ((ent = readdir(root))) {
-        if (ent->d_name[0] == '.') continue;
+        if (ent->d_name[0] == '.' || is_ps5_sidecar(ent->d_name)) continue;
         entries++;
         snprintf(only, sizeof(only), "%s", ent->d_name);
     }
@@ -917,13 +922,19 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
      * default block size) without an errno; write() returns 0 but the
      * name doesn't stick. Count both trees and fail loudly on mismatch. */
     {
-        uint64_t s_src = count_entries_recursive(files_dir);
-        uint64_t s_dst = count_entries_recursive(mnt);
+        int preserve_sce_sys = use_original && !upload_zero_sfo;
+        uint64_t s_src = preserve_sce_sys
+            ? count_entries_pfs_preserve_sce_sys(files_dir)
+            : count_entries_recursive(files_dir);
+        uint64_t s_dst = preserve_sce_sys
+            ? count_entries_pfs_preserve_sce_sys(mnt)
+            : count_entries_recursive(mnt);
         if (s_dst != s_src) {
+            uint64_t difference = s_src > s_dst ? s_src - s_dst : s_dst - s_src;
             worker_logf(cfg, job_id, "ERROR",
-                        "PFS truncated %llu entries (uploaded %llu, on disk %llu). "
+                        "PFS entry count mismatch of %llu (uploaded %llu, on disk %llu). "
                         "Container is too small for this many files — raise saveblocks or split the save.",
-                        (unsigned long long)(s_src - s_dst),
+                        (unsigned long long)difference,
                         (unsigned long long)s_src, (unsigned long long)s_dst);
             save_unmount();
             return -1;
