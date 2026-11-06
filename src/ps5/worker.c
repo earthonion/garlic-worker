@@ -738,7 +738,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     uint64_t data_size;
     if (saveblocks > 0) {
-        data_size = (uint64_t)saveblocks * 32768;
+        data_size = (uint64_t)saveblocks * 65536;
     } else {
         /* No SAVEDATA_BLOCKS — estimate from file sizes */
         data_size = 0;
