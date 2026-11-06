@@ -108,6 +108,13 @@ static void worker_self_update(worker_config_t *cfg) {
 #define SFO_AID_OFFSET_PS4 0x15C
 #define KEYSTONE_SIZE  0x400
 
+static int account_id_to_sfo_bytes(const char *hex, uint8_t out[8]) {
+    uint8_t be[8];
+    if (hex_to_bytes(hex, be, 8) != 8) return -1;
+    for (int i = 0; i < 8; i++) out[i] = be[7 - i];
+    return 0;
+}
+
 /* ── Transport mode (0=HTTP, 1=TCP) ────────────────────────────── */
 
 static int g_transport_mode = 0;
@@ -617,56 +624,61 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             continue;
         }
 
-        char sidecar[MAX_PATH_LEN];
-        snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", result_dir);
-        if (ps5param_export_blob(data_path, sidecar) < 0) {
-            worker_logf(cfg, job_id, "WARNING",
-                        "No original PS5PARAM blob for %s", basename);
-            save_unmount();
-            unlink(data_path);
-            continue;
-        }
-        struct stat image_st;
-        if (stat(data_path, &image_st) == 0) {
-            char size_path[MAX_PATH_LEN];
-            snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", result_dir);
-            int sfd = open(size_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-            if (sfd >= 0) {
-                char size_text[32];
-                int size_len = snprintf(size_text, sizeof(size_text), "%llu",
-                                        (unsigned long long)image_st.st_size);
-                write(sfd, size_text, size_len);
-                close(sfd);
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
+                 save_get_mount_point());
+        if (sfo_all_zero_file(sfo_path)) {
+            char sidecar[MAX_PATH_LEN];
+            snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", result_dir);
+            if (ps5param_export_blob(data_path, sidecar) < 0) {
+                worker_logf(cfg, job_id, "WARNING",
+                            "Zeroed SFO has no PS5PARAM blob for %s", basename);
+                save_unmount();
+                unlink(data_path);
+                continue;
             }
-        }
-
-        uint8_t key_data[0x100] = {0};
-        int key_image = open(data_path, O_RDONLY);
-        if (key_image >= 0 && pread(key_image, key_data, 0x60, 0x800) == 0x60) {
-            int pfsmgr = open("/dev/pfsmgr", O_RDWR);
-            if (pfsmgr >= 0) {
-                if (ioctl(pfsmgr, 0xc0845302, key_data) >= 0) {
-                    char key_path[MAX_PATH_LEN];
-                    snprintf(key_path, sizeof(key_path), "%s/PS5KEY", result_dir);
-                    int out = open(key_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-                    if (out >= 0) {
-                        write(out, key_data + 0x60, 0x20);
-                        close(out);
-                    }
+            struct stat image_st;
+            if (stat(data_path, &image_st) == 0) {
+                char size_path[MAX_PATH_LEN];
+                snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", result_dir);
+                int sfd = open(size_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (sfd >= 0) {
+                    char size_text[32];
+                    int size_len = snprintf(size_text, sizeof(size_text), "%llu",
+                                            (unsigned long long)image_st.st_size);
+                    write(sfd, size_text, size_len);
+                    close(sfd);
                 }
-                close(pfsmgr);
+            }
+
+            uint8_t key_data[0x100] = {0};
+            int key_image = open(data_path, O_RDONLY);
+            if (key_image >= 0 && pread(key_image, key_data, 0x60, 0x800) == 0x60) {
+                int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+                if (pfsmgr >= 0) {
+                    if (ioctl(pfsmgr, 0xc0845302, key_data) >= 0) {
+                        char key_path[MAX_PATH_LEN];
+                        snprintf(key_path, sizeof(key_path), "%s/PS5KEY", result_dir);
+                        int out = open(key_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                        if (out >= 0) {
+                            write(out, key_data + 0x60, 0x20);
+                            close(out);
+                        }
+                    }
+                    close(pfsmgr);
+                }
+            }
+            if (key_image >= 0) close(key_image);
+            char original_image[MAX_PATH_LEN];
+            snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", result_dir);
+            if (copy_file(data_path, original_image) < 0) {
+                worker_log(cfg, job_id, "ERROR", "Failed to preserve original PFS image");
+                save_unmount();
+                unlink(data_path);
+                return -1;
             }
         }
-        if (key_image >= 0) close(key_image);
         copy_mounted_to_result(result_dir, basename, include_sce_sys);
-        char original_image[MAX_PATH_LEN];
-        snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", result_dir);
-        if (copy_file(data_path, original_image) < 0) {
-            worker_log(cfg, job_id, "ERROR", "Failed to preserve original PFS image");
-            save_unmount();
-            unlink(data_path);
-            return -1;
-        }
         save_unmount();
         unlink(data_path);
         processed++;
@@ -773,7 +785,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         return -1;
     }
     uint64_t original_size = 0;
-    if (has_sidecar) {
+    {
         char size_path[MAX_PATH_LEN];
         snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", files_dir);
         int sfd = open(size_path, O_RDONLY);
@@ -791,7 +803,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     char original_image[MAX_PATH_LEN];
     snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", files_dir);
     struct stat original_st;
-    int use_original = !is_ps4_job && has_sidecar && original_size > 0 &&
+    int use_original = !is_ps4_job && has_original_key && original_size > 0 &&
         stat(original_image, &original_st) == 0 &&
         (uint64_t)original_st.st_size == original_size;
 
@@ -879,7 +891,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     /* Patch account ID if provided */
     if (account_id[0] && !preserve_sidecar) {
         uint8_t new_aid[8];
-        if (hex_to_bytes(account_id, new_aid, 8) == 8) {
+        if (account_id_to_sfo_bytes(account_id, new_aid) == 0) {
             char sfo_path[MAX_PATH_LEN];
             snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
             int sfo_fd = open(sfo_path, O_RDWR);
@@ -887,7 +899,9 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                 pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
                 close(sfo_fd);
                 sync();
-                worker_log(cfg, job_id, "INFO", "Patched account ID");
+                worker_logf(cfg, job_id, "INFO", "Patched account ID (%02x%02x%02x%02x%02x%02x%02x%02x)",
+                            new_aid[0], new_aid[1], new_aid[2], new_aid[3],
+                            new_aid[4], new_aid[5], new_aid[6], new_aid[7]);
             }
         }
     }
@@ -917,7 +931,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
         unlink(saved_sidecar);
         worker_log(cfg, job_id, "INFO", "PS5PARAM: restored original encrypted blob for zeroed param.sfo");
-    } else if (enc_sfo_len) {
+    } else if (has_sidecar && enc_sfo_len) {
         int wr = ps5param_write_sfo(img_path, enc_sfo, enc_sfo_len);
         if (wr < 0)
             worker_logf(cfg, job_id, "WARNING",
@@ -975,7 +989,7 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
     }
 
     uint8_t new_aid[8];
-    if (hex_to_bytes(account_id, new_aid, 8) != 8) {
+    if (account_id_to_sfo_bytes(account_id, new_aid) != 0) {
         worker_log(cfg, job_id, "ERROR", "Invalid account_id format");
         return -1;
     }
@@ -1126,7 +1140,7 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
     }
 
     uint8_t new_aid[8];
-    if (hex_to_bytes(account_id, new_aid, 8) != 8) {
+    if (account_id_to_sfo_bytes(account_id, new_aid) != 0) {
         worker_log(cfg, job_id, "ERROR", "Invalid account_id format");
         return -1;
     }
