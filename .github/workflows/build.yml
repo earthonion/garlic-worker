@@ -2,6 +2,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 permissions:
   contents: write
@@ -25,9 +26,42 @@ jobs:
       - name: Build PS4
         run: make ps4 PS4_PAYLOAD_SDK=$PWD/ps4-sdk/ps4-payload-sdk
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: garlic-worker
           path: |
             garlic-worker-ps5.elf
             garlic-worker-ps4.elf
+        continue-on-error: true
+      - name: Create release (on tag push only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF#refs/tags/}"
+          API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+
+          REL_ID=$(curl -fsS -H "Authorization: token $TOKEN" \
+              "$API/releases/tags/$TAG" 2>/dev/null \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id",""))' \
+              2>/dev/null || true)
+          if [ -z "${REL_ID:-}" ]; then
+              REL_ID=$(curl -fsS -X POST -H "Authorization: token $TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"target_commitish\":\"$GITHUB_SHA\"}" \
+                  "$API/releases" \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          fi
+
+          for elf in garlic-worker-ps5.elf garlic-worker-ps4.elf; do
+              curl -fsS -H "Authorization: token $TOKEN" "$API/releases/$REL_ID/assets" \
+                  | python3 -c "import json,sys; [print(a['id']) for a in json.load(sys.stdin) if a['name']=='$elf']" \
+                  | while read aid; do
+                      [ -n "$aid" ] && curl -fsS -X DELETE -H "Authorization: token $TOKEN" \
+                          "$API/releases/$REL_ID/assets/$aid"
+                    done
+              curl -fsS -X POST -H "Authorization: token $TOKEN" \
+                  -F "attachment=@$elf" \
+                  "$API/releases/$REL_ID/assets?name=$elf"
+          done
