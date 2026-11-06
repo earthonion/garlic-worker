@@ -726,9 +726,21 @@ int ps5param_write_sfo(const char *img, const uint8_t *sfo, uint32_t sz) {
         if (en == 1) {
             garlic_log("[Garlic] PS5PARAM: retrying blob write after enabling mode\n");
             r = ps5param_ioctl(img, blob, sizeof(blob), 1);
+        }
+        if (r < 0) {
+            /* pwrite blob to disk first, then retry ioctl — if the ioctl
+             * succeeds this time it regenerates the ICV */
+            garlic_log("[Garlic] PS5PARAM: writing blob to file, retrying ioctl for ICV\n");
+            int fd = open(img, O_RDWR);
+            if (fd >= 0) {
+                pwrite(fd, blob, sizeof(blob), 0xC00);
+                fsync(fd);
+                close(fd);
+                r = ps5param_ioctl(img, blob, sizeof(blob), 1);
+            }
             if (r < 0) {
                 garlic_log("[Garlic] PS5PARAM: ioctl still fails, rolling back header\n");
-                int fd = open(img, O_RDWR);
+                fd = open(img, O_RDWR);
                 if (fd >= 0) {
                     pwrite(fd, &saved, 8, 0x368);
                     static uint8_t zbuf[0x8000];
