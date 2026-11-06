@@ -670,11 +670,14 @@ static int ps5param_enable_blob_mode(const char *img, uint64_t *saved) {
     uint64_t cur;
     memcpy(&cur, raw, 8);
     *saved = cur;
-    if (cur != 0) { close(fd); return 0; }
-    uint64_t mode = 0x60;
-    if (pwrite(fd, &mode, 8, 0x368) != 8) { close(fd); return -1; }
+    uint32_t lo;
+    memcpy(&lo, raw, 4);
+    if ((lo & 0xFF) == 0x60) { close(fd); return 0; }
+    uint32_t mode32 = 0x60;
+    if (pwrite(fd, &mode32, 4, 0x368) != 4) { close(fd); return -1; }
+    fsync(fd);
     close(fd);
-    garlic_log("[Garlic] PS5PARAM: enabled blob mode (0x368=0x60)\n");
+    garlic_log("[Garlic] PS5PARAM: enabled blob mode (0x368 lo=0x60, was 0x%08x)\n", lo);
     return 1;
 }
 
@@ -724,9 +727,25 @@ int ps5param_write_sfo(const char *img, const uint8_t *sfo, uint32_t sz) {
             garlic_log("[Garlic] PS5PARAM: retrying blob write after enabling mode\n");
             r = ps5param_ioctl(img, blob, sizeof(blob), 1);
             if (r < 0) {
+                garlic_log("[Garlic] PS5PARAM: ioctl still fails, rolling back header\n");
                 int fd = open(img, O_RDWR);
-                if (fd >= 0) { pwrite(fd, &saved, 8, 0x368); close(fd); }
+                if (fd >= 0) {
+                    pwrite(fd, &saved, 8, 0x368);
+                    static uint8_t zbuf[0x8000];
+                    memset(zbuf, 0, sizeof(zbuf));
+                    pwrite(fd, zbuf, sizeof(zbuf), 0xC00);
+                    fsync(fd);
+                    close(fd);
+                }
             }
+        }
+    }
+    if (r == 0) {
+        int fd = open(img, O_RDWR);
+        if (fd >= 0) {
+            pwrite(fd, blob, sizeof(blob), 0xC00);
+            fsync(fd);
+            close(fd);
         }
     }
     return r;
