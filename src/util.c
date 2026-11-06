@@ -103,7 +103,7 @@ static int _is_sce_sys_path(const char *relpath) {
 }
 
 static int _copy_pfs_recursive(const char *src, const char *dst,
-                                const char *src_base) {
+                                const char *src_base, int preserve_sce_sys) {
     mkdir(dst, 0777);
     DIR *d = opendir(src);
     if (!d) return -1;
@@ -116,9 +116,9 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
         snprintf(sp, sizeof(sp), "%s/%s", src, ent->d_name);
         snprintf(dp, sizeof(dp), "%s/%s", dst, ent->d_name);
 
-        /* Compute relative path from source base for uid decision */
         const char *relpath = sp + strlen(src_base);
         if (*relpath == '/') relpath++;
+        if (preserve_sce_sys && _is_sce_sys_path(relpath)) continue;
 
         /* sce_sys and memory.dat → uid 0, everything else → uid 1 */
         if (_is_sce_sys_path(relpath) || strcmp(ent->d_name, "memory.dat") == 0)
@@ -130,7 +130,7 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
         if (stat(sp, &st) < 0) continue;
         int r;
         if (S_ISDIR(st.st_mode)) {
-            r = _copy_pfs_recursive(sp, dp, src_base);
+            r = _copy_pfs_recursive(sp, dp, src_base, preserve_sce_sys);
         } else {
             /* Create file first (like cecie.nim does) */
             int fd = open(dp, O_CREAT | O_TRUNC, 0777);
@@ -155,7 +155,12 @@ int copy_dir_pfs(const char *src, const char *dst) {
      * process umask 022/002 strips world-write from files, producing 0775
      * dir/file modes that the game rejects as corrupt savedata. */
     umask(0);
-    return _copy_pfs_recursive(src, dst, src);
+    return _copy_pfs_recursive(src, dst, src, 0);
+}
+
+int copy_dir_pfs_preserve_sce_sys(const char *src, const char *dst) {
+    umask(0);
+    return _copy_pfs_recursive(src, dst, src, 1);
 }
 
 int hex_to_bytes(const char *hex, uint8_t *out, int max_bytes) {

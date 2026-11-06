@@ -895,13 +895,17 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     char uploaded_sfo[MAX_PATH_LEN];
     snprintf(uploaded_sfo, sizeof(uploaded_sfo), "%s/sce_sys/param.sfo", files_dir);
     int upload_zero_sfo = sfo_all_zero_file(uploaded_sfo);
-    if (upload_zero_sfo && !has_sidecar) {
-        worker_log(cfg, job_id, "ERROR", "Zeroed param.sfo requires its original PS5PARAM blob");
+    if (upload_zero_sfo && (!has_sidecar || !use_original)) {
+        worker_log(cfg, job_id, "ERROR",
+                   "Zeroed param.sfo requires a compatible original image, PS5PARAM blob and PS5KEY");
         save_unmount();
         return -1;
     }
-    preserve_sidecar = has_sidecar && original_size > 0;
-    if (copy_dir_recursive(files_dir, mnt) < 0) {
+    preserve_sidecar = use_original && has_sidecar && upload_zero_sfo;
+    int copy_result = use_original && !upload_zero_sfo
+        ? copy_dir_pfs_preserve_sce_sys(files_dir, mnt)
+        : copy_dir_pfs(files_dir, mnt);
+    if (copy_result < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to copy files into PFS (out of space?)");
         save_unmount();
         return -1;
@@ -972,12 +976,14 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         worker_log(cfg, job_id, "INFO", "PS5PARAM: restored original encrypted blob for zeroed param.sfo");
     } else if (has_sidecar && enc_sfo_len) {
         int wr = ps5param_write_sfo(img_path, enc_sfo, enc_sfo_len);
-        if (wr < 0)
-            worker_logf(cfg, job_id, "WARNING",
-                        "PS5PARAM blob write failed (%d); SFO remains in PFS only", wr);
-        else
-            worker_logf(cfg, job_id, "INFO",
-                        "PS5PARAM: wrote param.sfo (%u B) into image blob", enc_sfo_len);
+        if (wr < 0) {
+            unlink(saved_sidecar);
+            unlink(img_path);
+            worker_logf(cfg, job_id, "ERROR", "PS5PARAM blob write failed (%d)", wr);
+            return -1;
+        }
+        worker_logf(cfg, job_id, "INFO",
+                    "PS5PARAM: wrote param.sfo (%u B) into image blob", enc_sfo_len);
     } else {
         unlink(saved_sidecar);
     }
