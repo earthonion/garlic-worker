@@ -181,6 +181,41 @@ static void worker_set_status(worker_config_t *cfg, const char *job_id,
     }
 }
 
+static int flatten_single_save_directory(const char *files_dir) {
+    DIR *root = opendir(files_dir);
+    if (!root) return -1;
+    char only[MAX_PATH_LEN] = {0};
+    int entries = 0;
+    struct dirent *ent;
+    while ((ent = readdir(root))) {
+        if (ent->d_name[0] == '.') continue;
+        entries++;
+        snprintf(only, sizeof(only), "%s", ent->d_name);
+    }
+    closedir(root);
+    if (entries != 1) return 0;
+
+    char nested[MAX_PATH_LEN];
+    snprintf(nested, sizeof(nested), "%s/%s", files_dir, only);
+    struct stat st;
+    if (stat(nested, &st) < 0 || !S_ISDIR(st.st_mode)) return 0;
+
+    DIR *sub = opendir(nested);
+    if (!sub) return -1;
+    while ((ent = readdir(sub))) {
+        if (ent->d_name[0] == '.') continue;
+        char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
+        snprintf(src, sizeof(src), "%s/%s", nested, ent->d_name);
+        snprintf(dst, sizeof(dst), "%s/%s", files_dir, ent->d_name);
+        if (rename(src, dst) < 0) {
+            closedir(sub);
+            return -1;
+        }
+    }
+    closedir(sub);
+    return rmdir(nested);
+}
+
 static int worker_download_files(worker_config_t *cfg, const char *job_id,
                                  const char *work_dir) {
     char zip_path[MAX_PATH_LEN];
@@ -238,6 +273,10 @@ static int worker_download_files(worker_config_t *cfg, const char *job_id,
         return -1;
     }
 
+    if (flatten_single_save_directory(files_dir) < 0) {
+        garlic_log("[Garlic] Failed to flatten enclosing save directory\n");
+        return -1;
+    }
     garlic_log("[Garlic] Downloaded and extracted %d files\n", count);
     return 0;
 }
