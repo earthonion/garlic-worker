@@ -187,38 +187,40 @@ static int is_ps5_sidecar(const char *name) {
 }
 
 static int flatten_single_save_directory(const char *files_dir) {
-    DIR *root = opendir(files_dir);
-    if (!root) return -1;
-    char only[MAX_PATH_LEN] = {0};
-    int entries = 0;
-    struct dirent *ent;
-    while ((ent = readdir(root))) {
-        if (ent->d_name[0] == '.' || is_ps5_sidecar(ent->d_name)) continue;
-        entries++;
-        snprintf(only, sizeof(only), "%s", ent->d_name);
-    }
-    closedir(root);
-    if (entries != 1) return 0;
-
-    char nested[MAX_PATH_LEN];
-    snprintf(nested, sizeof(nested), "%s/%s", files_dir, only);
-    struct stat st;
-    if (stat(nested, &st) < 0 || !S_ISDIR(st.st_mode)) return 0;
-
-    DIR *sub = opendir(nested);
-    if (!sub) return -1;
-    while ((ent = readdir(sub))) {
-        if (ent->d_name[0] == '.') continue;
-        char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
-        snprintf(src, sizeof(src), "%s/%s", nested, ent->d_name);
-        snprintf(dst, sizeof(dst), "%s/%s", files_dir, ent->d_name);
-        if (rename(src, dst) < 0) {
-            closedir(sub);
-            return -1;
+    for (;;) {
+        DIR *root = opendir(files_dir);
+        if (!root) return -1;
+        char only[MAX_PATH_LEN] = {0};
+        int entries = 0;
+        struct dirent *ent;
+        while ((ent = readdir(root))) {
+            if (ent->d_name[0] == '.' || is_ps5_sidecar(ent->d_name)) continue;
+            entries++;
+            snprintf(only, sizeof(only), "%s", ent->d_name);
         }
+        closedir(root);
+        if (entries != 1) return 0;
+
+        char nested[MAX_PATH_LEN];
+        snprintf(nested, sizeof(nested), "%s/%s", files_dir, only);
+        struct stat st;
+        if (stat(nested, &st) < 0 || !S_ISDIR(st.st_mode)) return 0;
+
+        DIR *sub = opendir(nested);
+        if (!sub) return -1;
+        while ((ent = readdir(sub))) {
+            if (ent->d_name[0] == '.') continue;
+            char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
+            snprintf(src, sizeof(src), "%s/%s", nested, ent->d_name);
+            snprintf(dst, sizeof(dst), "%s/%s", files_dir, ent->d_name);
+            if (rename(src, dst) < 0) {
+                closedir(sub);
+                return -1;
+            }
+        }
+        closedir(sub);
+        if (rmdir(nested) < 0) return -1;
     }
-    closedir(sub);
-    return rmdir(nested);
 }
 
 static int worker_download_files(worker_config_t *cfg, const char *job_id,
@@ -750,6 +752,80 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
     return 0;
 }
 
+static int sfo_format_is_ps4(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    static uint8_t buf[0x8000];
+    ssize_t size = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (size < 20 || buf[0] != 0 || buf[1] != 'P' || buf[2] != 'S' || buf[3] != 'F') return -1;
+    uint32_t key_off, data_off, count;
+    memcpy(&key_off, buf + 8, 4);
+    memcpy(&data_off, buf + 12, 4);
+    memcpy(&count, buf + 16, 4);
+    for (uint32_t i = 0; i < count && 20 + (i + 1) * 16 <= (uint32_t)size; i++) {
+        uint16_t key_rel, format;
+        uint32_t data_rel;
+        memcpy(&key_rel, buf + 20 + i * 16, 2);
+        memcpy(&format, buf + 20 + i * 16 + 2, 2);
+        memcpy(&data_rel, buf + 20 + i * 16 + 12, 4);
+        if (format != 0x0204 || key_off + key_rel >= (uint32_t)size ||
+            data_off + data_rel >= (uint32_t)size) continue;
+        if (strcmp((char *)buf + key_off + key_rel, "FORMAT") != 0) continue;
+        const char *value = (char *)buf + data_off + data_rel;
+        if (strcmp(value, "obs") == 0) return 1;
+        if (strcmp(value, "ppr") == 0) return 0;
+    }
+    return -1;
+}
+
+static int detect_upload_is_ps4(const char *files_dir) {
+    char image_path[MAX_PATH_LEN];
+    snprintf(image_path, sizeof(image_path), "%s/PS5IMAGE", files_dir);
+    struct stat st;
+    if (stat(image_path, &st) == 0) return detect_is_ps4(image_path);
+    char sfo_path[MAX_PATH_LEN];
+    snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", files_dir);
+    return sfo_format_is_ps4(sfo_path);
+}
+
+static int validate_copied_files(const char *src, const char *dst,
+                                 const char *src_base, const char *dst_base,
+                                 int preserve_sce_sys) {
+    DIR *d = opendir(src);
+    if (!d) return -1;
+    int result = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.' || is_ps5_sidecar(ent->d_name)) continue;
+        char sp[MAX_PATH_LEN], dp[MAX_PATH_LEN];
+        snprintf(sp, sizeof(sp), "%s/%s", src, ent->d_name);
+        snprintf(dp, sizeof(dp), "%s/%s", dst, ent->d_name);
+        const char *relpath = sp + strlen(src_base);
+        if (*relpath == '/') relpath++;
+        if (preserve_sce_sys && strncmp(relpath, "sce_sys", 7) == 0 &&
+            (relpath[7] == '/' || relpath[7] == '\0')) continue;
+        struct stat source_st, dest_st;
+        if (stat(sp, &source_st) < 0) {
+            result = -1;
+            break;
+        }
+        if (stat(dp, &dest_st) < 0 ||
+            (S_ISDIR(source_st.st_mode) != S_ISDIR(dest_st.st_mode)) ||
+            (!S_ISDIR(source_st.st_mode) && source_st.st_size != dest_st.st_size)) {
+            result = -1;
+            break;
+        }
+        if (S_ISDIR(source_st.st_mode) &&
+            validate_copied_files(sp, dp, src_base, dst_base, preserve_sce_sys) < 0) {
+            result = -1;
+            break;
+        }
+    }
+    closedir(d);
+    return result;
+}
+
 static int process_encrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir,
                            int is_ps4_job) {
@@ -772,6 +848,13 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     char files_dir[MAX_PATH_LEN];
     snprintf(files_dir, sizeof(files_dir), "%s/files", work_dir);
+
+    int detected_ps4 = detect_upload_is_ps4(files_dir);
+    if (detected_ps4 >= 0 && detected_ps4 != is_ps4_job) {
+        worker_logf(cfg, job_id, "INFO", "Using %s container format from save metadata",
+                    detected_ps4 ? "PS4" : "PS5");
+        is_ps4_job = detected_ps4;
+    }
 
     /* If saveblocks wasn't in job params, try reading from extracted param.sfo */
     if (saveblocks <= 0) {
@@ -917,25 +1000,10 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     }
     sync();
 
-    /* Verify entry count — the PS5 kernel silently drops directory entries
-     * past a per-container ceiling (observed at ~1369 files/dir with the
-     * default block size) without an errno; write() returns 0 but the
-     * name doesn't stick. Count both trees and fail loudly on mismatch. */
     {
         int preserve_sce_sys = use_original && !upload_zero_sfo;
-        uint64_t s_src = preserve_sce_sys
-            ? count_entries_pfs_preserve_sce_sys(files_dir)
-            : count_entries_recursive(files_dir);
-        uint64_t s_dst = preserve_sce_sys
-            ? count_entries_pfs_preserve_sce_sys(mnt)
-            : count_entries_recursive(mnt);
-        if (s_dst != s_src) {
-            uint64_t difference = s_src > s_dst ? s_src - s_dst : s_dst - s_src;
-            worker_logf(cfg, job_id, "ERROR",
-                        "PFS entry count mismatch of %llu (uploaded %llu, on disk %llu). "
-                        "Container is too small for this many files — raise saveblocks or split the save.",
-                        (unsigned long long)difference,
-                        (unsigned long long)s_src, (unsigned long long)s_dst);
+        if (validate_copied_files(files_dir, mnt, files_dir, mnt, preserve_sce_sys) < 0) {
+            worker_log(cfg, job_id, "ERROR", "PFS payload validation failed: a copied file is missing or truncated");
             save_unmount();
             return -1;
         }
