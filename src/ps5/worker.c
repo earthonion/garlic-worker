@@ -1009,9 +1009,14 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         return -1;
     }
     preserve_sidecar = use_original && has_sidecar && upload_zero_sfo;
-    int copy_result = use_original && !upload_zero_sfo
-        ? copy_dir_pfs_preserve_sce_sys(files_dir, mnt)
-        : copy_dir_pfs(files_dir, mnt);
+    int copy_result;
+    if (!is_ps4_job) {
+        copy_result = copy_dir_recursive(files_dir, mnt);
+    } else if (use_original && !upload_zero_sfo) {
+        copy_result = copy_dir_pfs_preserve_sce_sys(files_dir, mnt);
+    } else {
+        copy_result = copy_dir_pfs(files_dir, mnt);
+    }
     if (copy_result < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to copy files into PFS (out of space?)");
         save_unmount();
@@ -1020,7 +1025,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     sync();
 
     {
-        int preserve_sce_sys = use_original && !upload_zero_sfo;
+        int preserve_sce_sys = is_ps4_job && use_original && !upload_zero_sfo;
         if (validate_copied_files(files_dir, mnt, files_dir, mnt, preserve_sce_sys) < 0) {
             worker_log(cfg, job_id, "ERROR", "PFS payload validation failed: a copied file is missing or truncated");
             save_unmount();

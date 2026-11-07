@@ -254,13 +254,15 @@ int save_unmount(void) {
     UmountOpt uopt;
     memset(&uopt, 0, sizeof(uopt));
     sceFsInitUmountSaveDataOpt(&uopt);
-    sceFsUmountSaveData(&uopt, GARLIC_MOUNT_POINT, 0, 0);
+    int ret = sceFsUmountSaveData(&uopt, GARLIC_MOUNT_POINT, 0, 0);
     sync();
+    if (ret < 0)
+        garlic_log("[Garlic] Unmount failed (0x%x, errno=%d)\n", ret, errno);
 
     g_mounted = 0;
     g_local_copy[0] = 0;
     g_mount_real_sfo_len = 0;
-    return 0;
+    return ret;
 }
 
 /* ── Create new PFS image ──────────────────────────────────────── */
@@ -282,7 +284,7 @@ int save_create_pfs(const char *image_path, uint64_t size, int exact) {
         return -1;
     }
 
-    int ret = sceFsUfsAllocateSaveData(fd, img_size, 0x80, 0);
+    int ret = sceFsUfsAllocateSaveData(fd, img_size, 0, 0);
     if (ret < 0) {
         garlic_log("[Garlic] UfsAllocate failed (0x%x), using ftruncate\n", ret);
         if (ftruncate(fd, img_size) < 0) {
