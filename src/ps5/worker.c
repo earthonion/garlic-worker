@@ -59,6 +59,25 @@ static void worker_self_update(worker_config_t *cfg) {
                    (long long)st.st_size);
         return;
     }
+
+    /* Verify ELF magic before piping to elfldr — a gzip-compressed or
+     * otherwise corrupt download must not kill the worker. */
+    {
+        int vfd = open(UPDATE_TMP_PATH, O_RDONLY);
+        if (vfd < 0) { garlic_log("[Garlic] self_update: can't verify ELF\n"); return; }
+        unsigned char magic[4];
+        if (read(vfd, magic, 4) != 4 ||
+            magic[0] != 0x7f || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+            close(vfd);
+            garlic_log("[Garlic] self_update: bad ELF magic (%02x %02x %02x %02x), "
+                       "download likely gzip-corrupted\n",
+                       magic[0], magic[1], magic[2], magic[3]);
+            unlink(UPDATE_TMP_PATH);
+            return;
+        }
+        close(vfd);
+    }
+
     garlic_log("[Garlic] self_update: got %lld bytes, piping to elfldr\n",
                (long long)st.st_size);
 

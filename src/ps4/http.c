@@ -150,7 +150,8 @@ static int send_request(int sock, const char *method, const char *host,
                     "Host: %s\r\n",
                     method, path, host);
     pos += snprintf(hdr + pos, sizeof(hdr) - pos,
-                    "User-Agent: garlic-worker/" WORKER_VERSION " (PS4)\r\n");
+                    "User-Agent: garlic-worker/" WORKER_VERSION " (PS4)\r\n"
+                    "Accept-Encoding: identity\r\n");
     if (worker_key && worker_key[0])
         pos += snprintf(hdr + pos, sizeof(hdr) - pos,
                         "X-Worker-Key: %s\r\n", worker_key);
