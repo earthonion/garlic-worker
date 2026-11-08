@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -13,6 +14,8 @@
 #include <ps5/kernel.h>
 
 #include "savedata.h"
+#include "chives_io.h"
+#include "pfs_rebuild.h"
 #include "util.h"
 #include "log.h"
 
@@ -322,6 +325,43 @@ int save_create_pfs(const char *image_path, uint64_t size, int exact) {
     return 0;
 }
 
+int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expected) {
+    if (!expected) return -1;
+    kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+    uint64_t image_size = expected->block_count * (uint64_t)expected->block_size_bytes;
+    int native_allocation = expected->block_size_bytes == 65536;
+    int fd = open(image_path, O_CREAT | O_TRUNC | O_RDWR, 0777);
+    if (fd < 0) return -1;
+    int ret = sceFsUfsAllocateSaveData(fd, image_size, native_allocation ? 0x80 : 0, 0);
+    if (ret < 0 && native_allocation) {
+        close(fd);
+        unlink(image_path);
+        return -2;
+    }
+    if (ret < 0 && ftruncate(fd, image_size) < 0) {
+        close(fd);
+        unlink(image_path);
+        return -2;
+    }
+    close(fd);
+
+    CreateOpt copt;
+    memset(&copt, 0, sizeof(copt));
+    sceFsInitCreatePfsSaveDataOpt(&copt);
+    copt.blockSize = (int)expected->block_size_bytes;
+    copt.flags[1] = native_allocation ? 0 : 0x02;
+    ret = chives_ppr_create(&copt, image_path, image_size, expected);
+    if (ret < 0) {
+        unlink(image_path);
+        return -3;
+    }
+    if (chives_verify_created(image_path, expected) < 0) {
+        unlink(image_path);
+        return -4;
+    }
+    return 0;
+}
+
 /* ── Create new PS4-format PFS image with sealed-key companion .bin ── */
 int save_create_pfs_ps4(const char *image_path, uint64_t data_size) {
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
@@ -565,6 +605,35 @@ static void ps5param_elevate(void) {
     setuid(0);
 }
 
+static char g_ps5param_error[512];
+
+const char *ps5param_error(void) { return g_ps5param_error; }
+void ps5param_clear_error(void) { g_ps5param_error[0] = 0; }
+void ps5param_clear_warning(void) { }
+void ps5param_set_error(const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(g_ps5param_error, sizeof(g_ps5param_error), format, arguments);
+    va_end(arguments);
+}
+
+int read_sfo_file(const char *path, uint8_t *buf, uint32_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    int ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_size >= 20 && (uint64_t)st.st_size <= cap;
+    size_t total = 0, size = ok ? (size_t)st.st_size : 0;
+    while (ok && total < size) {
+        ssize_t n = read(fd, buf + total, size - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = 0; break; }
+        total += (size_t)n;
+    }
+    if (close(fd) < 0) ok = 0;
+    return ok && sfo_bytes_valid(buf, total) ? (int)total : -1;
+}
+
 typedef struct {
     const char *path;
     void *data;
@@ -579,6 +648,7 @@ static int ps5param_ioctl(const char *img, void *blob, int write) {
     };
     static int preferred_device = 4;
     int last_error = 0;
+    int soft_ok = 0;
 
     for (int attempt = 0; attempt < 5; attempt++) {
         int device = (preferred_device + attempt) % 5;
@@ -613,12 +683,16 @@ static int ps5param_ioctl(const char *img, void *blob, int write) {
                     close(fd);
                     return 0;
                 }
+                soft_ok = 1;
+            } else {
+                last_error = error ? error : EIO;
             }
-            last_error = error ? error : EIO;
-            if (!write && r >= 0)
-                break;
         }
         close(fd);
+    }
+    if (soft_ok) {
+        memset(blob, 0, 0x8000);
+        return 0;
     }
     return -(last_error ? last_error : EIO);
 }
@@ -643,6 +717,8 @@ int ps5param_read_sfo(const char *img, uint8_t *sfo, uint32_t sfomax) {
         garlic_log("[Garlic] PS5PARAM: bad blob header ver=%u size=%u off=%u\n", ver, sz, off);
         return -1002;
     }
+    if (!sfo_bytes_valid(blob + off, sz))
+        return -1003;
     memcpy(sfo, blob + off, sz);
     return (int)sz;
 }
@@ -668,12 +744,6 @@ int ps5param_write_sfo(const char *img, const uint8_t *sfo, uint32_t sz) {
 
     static uint8_t check[0x8000];
     int read_size = ps5param_read_sfo(img, check, sizeof(check));
-    if (read_size < 0) {
-        r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
-        if (r < 0)
-            return r;
-        read_size = ps5param_read_sfo(img, check, sizeof(check));
-    }
     g_ps5param_last_read_size = read_size;
     if (read_size < 0)
         return read_size;
@@ -751,20 +821,28 @@ int ps5param_restore_blob(const char *img, const char *sidecar) {
 }
 
 int sfo_bytes_valid(const uint8_t *buf, size_t size) {
-    if (!buf || size < 20) return 0;
-    if (buf[0] != 0x00 || buf[1] != 'P' || buf[2] != 'S' || buf[3] != 'F') return 0;
-    int all_zero = 1;
-    size_t check_len = size < 256 ? size : 256;
-    for (size_t i = 0; i < check_len; i++)
-        if (buf[i]) { all_zero = 0; break; }
-    if (all_zero) return 0;
-    uint32_t koff, doff, nent;
-    memcpy(&koff, buf + 8, 4);
-    memcpy(&doff, buf + 12, 4);
-    memcpy(&nent, buf + 16, 4);
-    if (nent == 0 || nent > 64) return 0;
-    if (koff >= size || doff >= size) return 0;
-    if (20 + (uint64_t)nent * 16 > size) return 0;
+    if (!buf || size < 20 || memcmp(buf, "\0PSF", 4))
+        return 0;
+    uint32_t keys, data, count;
+    memcpy(&keys, buf + 8, 4);
+    memcpy(&data, buf + 12, 4);
+    memcpy(&count, buf + 16, 4);
+    if (!count || count > (size - 20) / 16 ||
+        keys < 20 + (uint64_t)count * 16 || keys >= data || data > size)
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *entry = buf + 20 + i * 16;
+        uint16_t key;
+        uint32_t len, capacity, offset;
+        memcpy(&key, entry, 2);
+        memcpy(&len, entry + 4, 4);
+        memcpy(&capacity, entry + 8, 4);
+        memcpy(&offset, entry + 12, 4);
+        uint64_t kp = (uint64_t)keys + key, vp = (uint64_t)data + offset;
+        if (kp >= data || !memchr(buf + kp, 0, data - kp) || len > capacity || vp > size ||
+            capacity > size - vp)
+            return 0;
+    }
     return 1;
 }
 

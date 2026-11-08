@@ -18,6 +18,8 @@
 #include "zip.h"
 #include "tcp.h"
 #include "savedata.h"
+#include "chives_io.h"
+#include "pfs_rebuild.h"
 #include "util.h"
 #include "log.h"
 
@@ -202,7 +204,8 @@ static void worker_set_status(worker_config_t *cfg, const char *job_id,
 
 static int is_ps5_sidecar(const char *name) {
     return strcmp(name, "PS5PARAM") == 0 || strcmp(name, "PS5PARAM_SIZE") == 0 ||
-           strcmp(name, "PS5KEY") == 0 || strcmp(name, "PS5IMAGE") == 0;
+           strcmp(name, "PS5KEY") == 0 || strcmp(name, "PS5IMAGE") == 0 ||
+           strcmp(name, "chives.json") == 0;
 }
 
 static int flatten_single_save_directory(const char *files_dir) {
@@ -699,7 +702,8 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
                  save_get_mount_point());
-        if (sfo_all_zero_file(sfo_path)) {
+        int zero_sfo = sfo_all_zero_file(sfo_path);
+        if (zero_sfo) {
             char sidecar[MAX_PATH_LEN];
             snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", result_dir);
             if (ps5param_export_blob(data_path, sidecar) < 0) {
@@ -751,6 +755,32 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             }
         }
         copy_mounted_to_result(result_dir, basename, include_sce_sys);
+        if (!detect_is_ps4(data_path)) {
+            static uint8_t real_sfo[0x8000];
+            int real_sfo_len = read_effective_param_sfo(sfo_path, real_sfo, sizeof(real_sfo), NULL);
+            if (real_sfo_len > 0) {
+                char result_sfo[MAX_PATH_LEN];
+                snprintf(result_sfo, sizeof(result_sfo), "%s/%s/sce_sys/param.sfo",
+                         result_dir, basename);
+                char sys_dir[MAX_PATH_LEN];
+                snprintf(sys_dir, sizeof(sys_dir), "%s/%s/sce_sys", result_dir, basename);
+                mkdir(sys_dir, 0777);
+                if (install_sfo_file(result_sfo, real_sfo, (uint32_t)real_sfo_len) < 0) {
+                    worker_log(cfg, job_id, "ERROR", "Failed to write real param.sfo into decrypted output");
+                    save_unmount();
+                    unlink(data_path);
+                    return -1;
+                }
+            } else if (zero_sfo) {
+                worker_log(cfg, job_id, "ERROR", "Cannot recover real param.sfo for chives.json export");
+                save_unmount();
+                unlink(data_path);
+                return -1;
+            }
+            if (chives_write_export(data_path, save_get_mount_point(), result_dir) < 0) {
+                worker_log(cfg, job_id, "WARNING", "Failed to export chives.json geometry");
+            }
+        }
         save_unmount();
         unlink(data_path);
         processed++;
@@ -927,6 +957,13 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     char files_dir[MAX_PATH_LEN];
     snprintf(files_dir, sizeof(files_dir), "%s/files", work_dir);
 
+    chives_geometry_t original_geometry = {0};
+    int has_chives = chives_read_file(files_dir, &original_geometry);
+    if (has_chives < 0 || (has_chives && original_geometry.is_ps4)) {
+        worker_log(cfg, job_id, "ERROR", "Invalid or incompatible chives.json geometry");
+        return -1;
+    }
+
     int detected_ps4 = detect_upload_is_ps4(files_dir);
     if (detected_ps4 >= 0 && detected_ps4 != is_ps4_job) {
         worker_logf(cfg, job_id, "INFO", "Using %s container format from save metadata",
@@ -1018,7 +1055,23 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                                             sizeof(g_regen_source_sfo));
         g_regen_source_sfo_len = source_size > 0 ? (uint32_t)source_size : 0;
     }
-    int use_original = !is_ps4_job && has_original_key && original_size > 0 &&
+    if (has_chives) {
+        data_size = original_geometry.block_count * (uint64_t)original_geometry.block_size_bytes;
+        if (stat(original_image, &original_st) == 0) {
+            chives_geometry_t image_geometry;
+            if (chives_read_image(original_image, &image_geometry) < 0 ||
+                image_geometry.version != original_geometry.version ||
+                image_geometry.block_size_bytes != original_geometry.block_size_bytes ||
+                image_geometry.block_count != original_geometry.block_count ||
+                image_geometry.original_image_size_bytes != original_geometry.original_image_size_bytes ||
+                image_geometry.has_fs_ext != original_geometry.has_fs_ext ||
+                image_geometry.fs_ext != original_geometry.fs_ext) {
+                worker_log(cfg, job_id, "ERROR", "PS5IMAGE and chives.json geometry do not match");
+                return -1;
+            }
+        }
+    }
+    int use_original = !has_chives && !is_ps4_job && has_original_key && original_size > 0 &&
         stat(original_image, &original_st) == 0 &&
         (uint64_t)original_st.st_size == original_size;
 
@@ -1046,7 +1099,10 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                 return -1;
             }
         } else {
-            if (save_create_pfs(img_path, data_size, saveblocks > 0 || original_size > 0) < 0) {
+            int created = has_chives
+                ? save_create_pfs_chives(img_path, &original_geometry)
+                : save_create_pfs(img_path, data_size, saveblocks > 0 || original_size > 0);
+            if (created < 0) {
                 worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
                 return -1;
             }
@@ -1058,6 +1114,11 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
     }
     unlink(original_image);
+    if (has_chives) {
+        char chives_path[MAX_PATH_LEN];
+        snprintf(chives_path, sizeof(chives_path), "%s/chives.json", files_dir);
+        unlink(chives_path);
+    }
 
     /* Copy files into mounted PFS. Fail loudly if any file copy errors:
      * silent ENOSPC in the middle of copy_dir_recursive was the source of
@@ -1154,6 +1215,16 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
         unlink(saved_sidecar);
         worker_log(cfg, job_id, "INFO", "PS5PARAM: restored original encrypted blob for zeroed param.sfo");
+    } else if (has_chives) {
+        unlink(saved_sidecar);
+        int wr = enc_sfo_len ? finalize_ps5_sfo(img_path, enc_sfo, enc_sfo_len, 1) : -1;
+        if (wr < 0) {
+            unlink(img_path);
+            worker_logf(cfg, job_id, "ERROR", "%s",
+                        ps5param_error()[0] ? ps5param_error() : "Cannot read complete final PS5 param.sfo; output was not published");
+            return -1;
+        }
+        worker_logf(cfg, job_id, "INFO", "Finalized real param.sfo (%u B) using chives.json geometry", enc_sfo_len);
     } else if (!use_original && upload_zero_sfo) {
         unlink(saved_sidecar);
         if (!enc_sfo_len ||

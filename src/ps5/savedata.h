@@ -2,6 +2,7 @@
 #define SAVEDATA_H
 
 #include <stdint.h>
+#include "chives.h"
 
 /* ── SDK type definitions ──────────────────────────────────────── */
 typedef struct { uint8_t reserved; char *budgetid; } MountOpt;
@@ -51,6 +52,7 @@ int save_unmount(void);
  * exact=0: size is estimated data; overhead + alignment added.
  * Returns 0 on success. */
 int save_create_pfs(const char *image_path, uint64_t size, int exact);
+int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expected);
 
 /* Create a new PS4-format PFS image with sealed-key companion .bin.
  * Uses /dev/pfsmgr ioctls 0x40845303 (generate) + 0xc0845302 (decrypt)
@@ -117,5 +119,11 @@ const uint8_t *ps5param_get_cached_sfo(void);
 extern int g_ps5param_last_read_size;
 extern int g_ps5param_last_ioctl_result;
 extern int g_ps5param_last_ioctl_errno;
+
+const char *ps5param_error(void);
+void ps5param_clear_error(void);
+void ps5param_clear_warning(void);
+void ps5param_set_error(const char *format, ...);
+int read_sfo_file(const char *path, uint8_t *buf, uint32_t cap);
 
 #endif

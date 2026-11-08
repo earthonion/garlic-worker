@@ -2,7 +2,7 @@ PS4_PAYLOAD_SDK ?= $(HOME)/code/ps4/ps4-payload-dev-sdk
 PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
 
 WORKER_KEY := $(shell python3 -c "import secrets; print(secrets.token_hex(32))")
-WORKER_VERSION ?= v1.4.0
+WORKER_VERSION ?= v1.5.0
 
 # Shared sources
 SHARED_SRCS := src/config.c src/json.c src/zip.c src/util.c src/log.c src/killswitch.c src/tcp.c
@@ -13,7 +13,8 @@ PS5_CFLAGS  := -O2 -Wall -D_BSD_SOURCE -std=gnu11 -Isrc -Isrc/ps5 \
                -I$(PS5_PAYLOAD_SDK)/target/include -DWORKER_KEY=\"$(WORKER_KEY)\" -DWORKER_VERSION=\"$(WORKER_VERSION)\"
 PS5_LDFLAGS := -L$(PS5_PAYLOAD_SDK)/target/lib
 PS5_LIBS    := -lkernel_sys -lkernel -lSceSystemService -lSceUserService -lSceFsInternalForVsh -lSceNet
-PS5_SRCS    := src/ps5/main.c src/ps5/http.c src/ps5/worker.c src/ps5/savedata.c
+PS5_SRCS    := src/ps5/main.c src/ps5/http.c src/ps5/worker.c src/ps5/savedata.c \
+               src/ps5/chives.c src/ps5/chives_io.c src/ps5/metadata_layout.c src/ps5/pfs_rebuild.c
 
 # PS4
 PS4_CC      := $(PS4_PAYLOAD_SDK)/bin/orbis-clang
