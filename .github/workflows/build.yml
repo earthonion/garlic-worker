@@ -37,11 +37,20 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           TAG="${GITHUB_REF#refs/tags/}"
-          API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
 
+          if [ "$GITHUB_SERVER_URL" = "https://github.com" ]; then
+              if ! gh release view "$TAG" >/dev/null 2>&1; then
+                  gh release create "$TAG" --verify-tag --title "$TAG" --notes ""
+              fi
+              gh release upload "$TAG" garlic-worker-ps5.elf garlic-worker-ps4.elf --clobber
+              exit 0
+          fi
+
+          API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
           REL_ID=$(curl -fsS -H "Authorization: token $TOKEN" \
               "$API/releases/tags/$TAG" 2>/dev/null \
               | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id",""))' \
