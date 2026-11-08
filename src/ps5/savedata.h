@@ -114,5 +114,8 @@ int sfo_read_savedata_blocks_mem(const uint8_t *buf, size_t size);
 /* Access the cached blob SFO from the last ps5param_capture_for_image() call. */
 uint32_t ps5param_get_cached_sfo_len(void);
 const uint8_t *ps5param_get_cached_sfo(void);
+extern int g_ps5param_last_read_size;
+extern int g_ps5param_last_ioctl_result;
+extern int g_ps5param_last_ioctl_errno;
 
 #endif

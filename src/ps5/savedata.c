@@ -24,6 +24,9 @@ static char g_local_copy[MAX_PATH_LEN] = {0};
 /* Real param.sfo recovered from PS5PARAM blob (cached per mount) */
 static uint8_t g_mount_real_sfo[0x8000];
 static uint32_t g_mount_real_sfo_len = 0;
+int g_ps5param_last_read_size = -1;
+int g_ps5param_last_ioctl_result = 0;
+int g_ps5param_last_ioctl_errno = 0;
 
 /* ── Init ──────────────────────────────────────────────────────── */
 void savedata_init(void) {
@@ -550,8 +553,7 @@ void save_periodic_cleanup(void) {
 
 /* ── PS5PARAM blob I/O ─────────────────────────────────────────────
  * PS5 (ppr) saves keep the real param.sfo in an encrypted 0x8000-byte blob
- * in the image header at 0xC00.  The kernel exposes the blob through
- * sceFsTransactionSaveDataReadParam/WriteParam, which handles its encryption.
+ * in the image header at 0xC00. Reads and writes use the native pfsctl interface.
  * Blob layout: 'PS5PARAM' u64 | u32 ver=0 | u32 sfo_size | u32 sfo_off=20 | SFO
  */
 static void ps5param_elevate(void) {
@@ -563,39 +565,71 @@ static void ps5param_elevate(void) {
     setuid(0);
 }
 
-static int ps5param_enable_blob_mode(const char *img, uint64_t *saved) {
-    if (!img || !img[0] || !saved) return -1;
-    *saved = 0;
-    int fd = open(img, O_RDWR);
-    if (fd < 0) return -errno;
-    uint8_t type = 0;
-    uint8_t raw[8];
-    if (pread(fd, &type, 1, 0) != 1 || type != 0x02 ||
-        pread(fd, raw, 8, 0x368) != 8) {
+typedef struct {
+    const char *path;
+    void *data;
+    uint32_t size;
+    uint32_t padding;
+    void *result;
+} ps5param_ioctl_request_t;
+
+static int ps5param_ioctl(const char *img, void *blob, int write) {
+    static const char *const devices[] = {
+        "/dev/pfsctl", "/dev/pfsmgr", "/dev/devpfs.ctl", "/dev/pfs", "/dev/pfsctldev"
+    };
+    static int preferred_device = 4;
+    int last_error = 0;
+
+    for (int attempt = 0; attempt < 5; attempt++) {
+        int device = (preferred_device + attempt) % 5;
+        int fd = open(devices[device], O_RDONLY);
+        if (fd < 0 && errno == EACCES)
+            fd = open(devices[device], O_RDWR);
+        if (fd < 0) {
+            last_error = errno;
+            continue;
+        }
+
+        for (int alternative = 0; alternative < 2; alternative++) {
+            uint32_t command = write
+                ? (alternative ? 0x80209118 : 0x80189112)
+                : (alternative ? 0xC0209116 : 0xC0189111);
+            int result = 0;
+            ps5param_ioctl_request_t request = {img, blob, 0x8000, 0, &result};
+            if (!write)
+                memset(blob, 0, 0x8000);
+            errno = 0;
+            int r = ioctl(fd, command, &request);
+            int error = errno;
+            g_ps5param_last_ioctl_result = result;
+            g_ps5param_last_ioctl_errno = error;
+            garlic_log("[Garlic] PS5PARAM native dev=%s cmd=%08x ret=%d result=%d errno=%d\n",
+                       devices[device], command, r, result, error);
+            if (r >= 0) {
+                uint64_t magic = 0;
+                memcpy(&magic, blob, 8);
+                if (write || magic == 0x4D41524150355350ULL) {
+                    preferred_device = device;
+                    close(fd);
+                    return 0;
+                }
+            }
+            last_error = error ? error : EIO;
+            if (!write && r >= 0)
+                break;
+        }
         close(fd);
-        return -1;
     }
-    uint64_t cur;
-    memcpy(&cur, raw, 8);
-    *saved = cur;
-    uint32_t lo;
-    memcpy(&lo, raw, 4);
-    if ((lo & 0xFF) == 0x60) { close(fd); return 0; }
-    uint32_t mode32 = 0x60;
-    if (pwrite(fd, &mode32, 4, 0x368) != 4) { close(fd); return -1; }
-    fsync(fd);
-    close(fd);
-    garlic_log("[Garlic] PS5PARAM: enabled blob mode (0x368 lo=0x60, was 0x%08x)\n", lo);
-    return 1;
+    return -(last_error ? last_error : EIO);
 }
 
 int ps5param_read_sfo(const char *img, uint8_t *sfo, uint32_t sfomax) {
     if (!img || !img[0] || !sfo || sfomax < 20) return -1;
     static uint8_t blob[0x8000];
-    memset(blob, 0, sizeof(blob));
     ps5param_elevate();
-    int r = sceFsTransactionSaveDataReadParam(img, blob, sizeof(blob));
-    if (r < 0) return r;
+    int r = ps5param_ioctl(img, blob, 0);
+    if (r < 0)
+        return r;
 
     uint64_t magic;
     uint32_t ver, sz, off;
@@ -614,7 +648,8 @@ int ps5param_read_sfo(const char *img, uint8_t *sfo, uint32_t sfomax) {
 }
 
 int ps5param_write_sfo(const char *img, const uint8_t *sfo, uint32_t sz) {
-    if (!img || !img[0] || !sfo || sz < 20 || sz > 0x8000 - 20)
+    if (!img || !img[0] || !sfo || sz < 20 || sz > 0x8000 - 20 ||
+        !sfo_bytes_valid(sfo, sz))
         return -1;
     static uint8_t blob[0x8000];
     memset(blob, 0, sizeof(blob));
@@ -627,23 +662,27 @@ int ps5param_write_sfo(const char *img, const uint8_t *sfo, uint32_t sz) {
     memcpy(blob + 20, sfo, sz);
 
     ps5param_elevate();
-    int r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
-    if (r < 0) {
-        uint64_t saved = 0;
-        int en = ps5param_enable_blob_mode(img, &saved);
-        if (en == 1) {
-            garlic_log("[Garlic] PS5PARAM: retrying blob write after enabling mode\n");
-            r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
-            if (r < 0) {
-                int fd = open(img, O_RDWR);
-                if (fd >= 0) {
-                    pwrite(fd, &saved, 8, 0x368);
-                    close(fd);
-                }
-            }
-        }
+    int r = ps5param_ioctl(img, blob, 1);
+    if (r < 0)
+        return r;
+
+    static uint8_t check[0x8000];
+    int read_size = ps5param_read_sfo(img, check, sizeof(check));
+    if (read_size < 0) {
+        r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
+        if (r < 0)
+            return r;
+        read_size = ps5param_read_sfo(img, check, sizeof(check));
     }
-    return r;
+    g_ps5param_last_read_size = read_size;
+    if (read_size < 0)
+        return read_size;
+    if ((uint32_t)read_size != sz || memcmp(check, sfo, sz) != 0) {
+        garlic_log("[Garlic] PS5PARAM read-back mismatch: expected %u B, got %d B\n",
+                   sz, read_size);
+        return -2;
+    }
+    return 0;
 }
 
 void ps5param_capture_for_image(const char *img) {

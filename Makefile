@@ -2,7 +2,7 @@ PS4_PAYLOAD_SDK ?= $(HOME)/code/ps4/ps4-payload-dev-sdk
 PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
 
 WORKER_KEY := $(shell python3 -c "import secrets; print(secrets.token_hex(32))")
-WORKER_VERSION ?= v1.3.9
+WORKER_VERSION ?= v1.4.0
 
 # Shared sources
 SHARED_SRCS := src/config.c src/json.c src/zip.c src/util.c src/log.c src/killswitch.c src/tcp.c

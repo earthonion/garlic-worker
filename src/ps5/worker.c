@@ -610,6 +610,9 @@ static int process_ppr_derive(worker_config_t *cfg, const char *job_id,
     return 0;
 }
 
+static uint8_t g_regen_source_sfo[0x8000];
+static uint32_t g_regen_source_sfo_len;
+
 static int process_decrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir) {
     worker_log(cfg, job_id, "INFO", "Downloading files...");
@@ -675,8 +678,12 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
         }
 
         /* PS5: capture real param.sfo from encrypted header blob before mount */
-        if (!detect_is_ps4(data_path))
+        if (!detect_is_ps4(data_path)) {
             ps5param_capture_for_image(data_path);
+            g_regen_source_sfo_len = ps5param_get_cached_sfo_len();
+            if (g_regen_source_sfo_len)
+                memcpy(g_regen_source_sfo, ps5param_get_cached_sfo(), g_regen_source_sfo_len);
+        }
 
         int mret = save_mount(data_path);
         if (mret < 0) {
@@ -805,6 +812,8 @@ static int detect_upload_is_ps4(const char *files_dir) {
     if (stat(image_path, &st) == 0) return detect_is_ps4(image_path);
     char sfo_path[MAX_PATH_LEN];
     snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", files_dir);
+    if (sfo_all_zero_file(sfo_path))
+        return 0;
     return sfo_format_is_ps4(sfo_path);
 }
 
@@ -843,6 +852,56 @@ static int validate_copied_files(const char *src, const char *dst,
     }
     closedir(d);
     return result;
+}
+
+static int restore_zero_sfo_from_cache(const char *mount_point) {
+    if (!g_regen_source_sfo_len || !sfo_bytes_valid(g_regen_source_sfo, g_regen_source_sfo_len)) {
+        garlic_log("[Garlic] cached original SFO failed validation\n");
+        return -1;
+    }
+    char sfo_path[MAX_PATH_LEN];
+    snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mount_point);
+    mkdir(sfo_path, 0777);
+    int fd = open(sfo_path, O_CREAT | O_WRONLY | O_TRUNC, 0777);
+    if (fd < 0) {
+        garlic_log("[Garlic] zero-SFO restore open failed: %s errno=%d\n", sfo_path, errno);
+        return -1;
+    }
+    ssize_t written = write(fd, g_regen_source_sfo, g_regen_source_sfo_len);
+    close(fd);
+    if (written != (ssize_t)g_regen_source_sfo_len) {
+        garlic_log("[Garlic] zero-SFO restore write failed: %zd/%u\n",
+                   written, g_regen_source_sfo_len);
+        return -1;
+    }
+    garlic_log("[Garlic] zero-SFO restored from the cached original SFO\n");
+    return 0;
+}
+
+static int verify_physical_sfo(const char *image_path, const uint8_t *key,
+                               const uint8_t *expected, uint32_t expected_len) {
+    if (save_mount_new(image_path, key) < 0) {
+        garlic_log("[Garlic] physical-SFO verification mount failed\n");
+        return -1;
+    }
+    char sfo_path[MAX_PATH_LEN];
+    snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
+             save_get_mount_point());
+    int fd = open(sfo_path, O_RDONLY);
+    static uint8_t actual[0x8000];
+    ssize_t actual_len = fd >= 0 ? read(fd, actual, sizeof(actual)) : -1;
+    if (fd >= 0)
+        close(fd);
+    int unmount_result = save_unmount();
+    if (actual_len != (ssize_t)expected_len ||
+        memcmp(actual, expected, expected_len) != 0 || unmount_result < 0) {
+        garlic_log("[Garlic] physical-SFO read-back failed: expected=%u actual=%zd unmount=%d\n",
+                   expected_len, actual_len, unmount_result);
+        return -1;
+    }
+    garlic_log("[Garlic] physical-SFO verified by exact remount read-back (%u B)\n",
+               expected_len);
+    return 0;
 }
 
 static int process_encrypt(worker_config_t *cfg, const char *job_id,
@@ -948,7 +1007,17 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     char original_image[MAX_PATH_LEN];
     snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", files_dir);
+    uint32_t cached_len = ps5param_get_cached_sfo_len();
+    if (cached_len) {
+        g_regen_source_sfo_len = cached_len;
+        memcpy(g_regen_source_sfo, ps5param_get_cached_sfo(), cached_len);
+    }
     struct stat original_st;
+    if (stat(original_image, &original_st) == 0) {
+        int source_size = ps5param_read_sfo(original_image, g_regen_source_sfo,
+                                            sizeof(g_regen_source_sfo));
+        g_regen_source_sfo_len = source_size > 0 ? (uint32_t)source_size : 0;
+    }
     int use_original = !is_ps4_job && has_original_key && original_size > 0 &&
         stat(original_image, &original_st) == 0 &&
         (uint64_t)original_st.st_size == original_size;
@@ -977,7 +1046,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                 return -1;
             }
         } else {
-            if (save_create_pfs(img_path, data_size, saveblocks > 0) < 0) {
+            if (save_create_pfs(img_path, data_size, saveblocks > 0 || original_size > 0) < 0) {
                 worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
                 return -1;
             }
@@ -1002,12 +1071,9 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     char uploaded_sfo[MAX_PATH_LEN];
     snprintf(uploaded_sfo, sizeof(uploaded_sfo), "%s/sce_sys/param.sfo", files_dir);
     int upload_zero_sfo = sfo_all_zero_file(uploaded_sfo);
-    if (upload_zero_sfo && (!has_sidecar || !use_original)) {
-        worker_log(cfg, job_id, "ERROR",
-                   "Zeroed param.sfo requires a compatible original image, PS5PARAM blob and PS5KEY");
-        save_unmount();
-        return -1;
-    }
+    if (upload_zero_sfo)
+        worker_logf(cfg, job_id, "INFO", "Zeroed SFO detected; cached original SFO length=%u",
+                    g_regen_source_sfo_len);
     preserve_sidecar = use_original && has_sidecar && upload_zero_sfo;
     int copy_result;
     if (!is_ps4_job) {
@@ -1031,6 +1097,13 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             save_unmount();
             return -1;
         }
+    }
+    if (upload_zero_sfo && (!has_sidecar || !use_original) &&
+        restore_zero_sfo_from_cache(mnt) < 0) {
+        worker_log(cfg, job_id, "ERROR",
+                   "Zeroed param.sfo requires a compatible original image, PS5PARAM blob and PS5KEY");
+        save_unmount();
+        return -1;
     }
 
     if (account_id[0] && !upload_zero_sfo) preserve_sidecar = 0;
@@ -1067,8 +1140,12 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
     }
 
-    save_unmount();
-
+    if (save_unmount() < 0) {
+        worker_log(cfg, job_id, "ERROR", "Cannot finalize save: unmount failed");
+        return -1;
+    }
+    worker_logf(cfg, job_id, "INFO", "PS5PARAM finalization: preserve=%d sidecar=%d enc_sfo_len=%u",
+                preserve_sidecar, has_sidecar, enc_sfo_len);
     if (preserve_sidecar) {
         if (ps5param_restore_blob(img_path, saved_sidecar) < 0) {
             unlink(saved_sidecar);
@@ -1077,12 +1154,24 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
         unlink(saved_sidecar);
         worker_log(cfg, job_id, "INFO", "PS5PARAM: restored original encrypted blob for zeroed param.sfo");
+    } else if (!use_original && upload_zero_sfo) {
+        unlink(saved_sidecar);
+        if (!enc_sfo_len ||
+            verify_physical_sfo(img_path, original_key, enc_sfo, enc_sfo_len) < 0) {
+            unlink(img_path);
+            worker_log(cfg, job_id, "ERROR",
+                       "Cannot read complete final PS5 param.sfo; output was not published");
+            return -1;
+        }
+        worker_log(cfg, job_id, "INFO", "Physical-SFO finalized by exact native remount read-back");
     } else if (has_sidecar && enc_sfo_len) {
         int wr = ps5param_write_sfo(img_path, enc_sfo, enc_sfo_len);
         if (wr < 0) {
             unlink(saved_sidecar);
             unlink(img_path);
-            worker_logf(cfg, job_id, "ERROR", "PS5PARAM blob write failed (%d)", wr);
+            worker_logf(cfg, job_id, "ERROR", "PS5PARAM blob write failed (%d), read-back=%d ioctl=%d errno=%d",
+                        wr, g_ps5param_last_read_size,
+                        g_ps5param_last_ioctl_result, g_ps5param_last_ioctl_errno);
             return -1;
         }
         worker_logf(cfg, job_id, "INFO",
