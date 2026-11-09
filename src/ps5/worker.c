@@ -223,17 +223,20 @@ static int flatten_single_save_directory(const char *files_dir) {
         closedir(root);
         if (entries != 1) return 0;
 
-        char nested[MAX_PATH_LEN];
+        char nested[MAX_PATH_LEN],staging[MAX_PATH_LEN];
         snprintf(nested, sizeof(nested), "%s/%s", files_dir, only);
+        snprintf(staging, sizeof(staging), "%s.flatten", files_dir);
         struct stat st;
         if (stat(nested, &st) < 0 || !S_ISDIR(st.st_mode)) return 0;
+        rmdir(staging);
+        if (rename(nested,staging) < 0) return -1;
 
-        DIR *sub = opendir(nested);
+        DIR *sub = opendir(staging);
         if (!sub) return -1;
         while ((ent = readdir(sub))) {
             if (ent->d_name[0] == '.') continue;
             char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
-            snprintf(src, sizeof(src), "%s/%s", nested, ent->d_name);
+            snprintf(src, sizeof(src), "%s/%s", staging, ent->d_name);
             snprintf(dst, sizeof(dst), "%s/%s", files_dir, ent->d_name);
             if (rename(src, dst) < 0) {
                 closedir(sub);
@@ -241,7 +244,7 @@ static int flatten_single_save_directory(const char *files_dir) {
             }
         }
         closedir(sub);
-        if (rmdir(nested) < 0) return -1;
+        if (rmdir(staging) < 0) return -1;
     }
 }
 
@@ -971,6 +974,23 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         is_ps4_job = detected_ps4;
     }
 
+    chives_geometry_t sfo_geometry;
+    if (!is_ps4_job && chives_sfo_geometry(files_dir, &sfo_geometry)) {
+        char image_path[MAX_PATH_LEN];
+        snprintf(image_path, sizeof(image_path), "%s/PS5IMAGE", files_dir);
+        struct stat image_st;
+        int has_image = stat(image_path, &image_st) == 0;
+        if (!has_chives || !has_image) {
+            if (!has_chives || memcmp(&original_geometry, &sfo_geometry, sizeof(sfo_geometry)))
+                worker_logf(cfg, job_id, "INFO",
+                            "Recovered PFS geometry from param.sfo: data=%llu system=%llu",
+                            (unsigned long long)(sfo_geometry.block_count - sfo_geometry.fs_ext),
+                            (unsigned long long)sfo_geometry.fs_ext);
+            original_geometry = sfo_geometry;
+            has_chives = 1;
+        }
+    }
+
     /* If saveblocks wasn't in job params, try reading from extracted param.sfo */
     if (saveblocks <= 0) {
         char sfo_path[MAX_PATH_LEN];
@@ -1217,14 +1237,19 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         worker_log(cfg, job_id, "INFO", "PS5PARAM: restored original encrypted blob for zeroed param.sfo");
     } else if (has_chives) {
         unlink(saved_sidecar);
-        int wr = enc_sfo_len ? finalize_ps5_sfo(img_path, enc_sfo, enc_sfo_len, 1) : -1;
-        if (wr < 0) {
-            unlink(img_path);
-            worker_logf(cfg, job_id, "ERROR", "%s",
-                        ps5param_error()[0] ? ps5param_error() : "Cannot read complete final PS5 param.sfo; output was not published");
-            return -1;
+        if (!enc_sfo_len && original_geometry.has_fs_ext && !original_geometry.fs_ext) {
+            worker_log(cfg, job_id, "INFO",
+                       "Physical container has no param.sfo; preserving its original layout");
+        } else {
+            int wr = enc_sfo_len ? finalize_ps5_sfo(img_path, enc_sfo, enc_sfo_len, 1) : -1;
+            if (wr < 0) {
+                unlink(img_path);
+                worker_logf(cfg, job_id, "ERROR", "%s",
+                            ps5param_error()[0] ? ps5param_error() : "Cannot read complete final PS5 param.sfo; output was not published");
+                return -1;
+            }
+            worker_logf(cfg, job_id, "INFO", "Finalized real param.sfo (%u B) using chives.json geometry", enc_sfo_len);
         }
-        worker_logf(cfg, job_id, "INFO", "Finalized real param.sfo (%u B) using chives.json geometry", enc_sfo_len);
     } else if (!use_original && upload_zero_sfo) {
         unlink(saved_sidecar);
         if (!enc_sfo_len ||

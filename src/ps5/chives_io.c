@@ -83,6 +83,38 @@ static uint64_t sfo_blocks(const uint8_t *sfo, size_t size, const char *field) {
     return 0;
 }
 
+int chives_sfo_geometry(const char *base, chives_geometry_t *geometry) {
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", base);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    static uint8_t sfo[0x8000];
+    struct stat st;
+    size_t size = 0;
+    int ok = fstat(fd, &st) == 0 && st.st_size >= 20 && st.st_size <= (off_t)sizeof(sfo);
+    while (ok && size < (size_t)st.st_size) {
+        ssize_t n = read(fd, sfo + size, (size_t)st.st_size - size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = 0; break; }
+        size += (size_t)n;
+    }
+    close(fd);
+    if (!ok || !sfo_bytes_valid(sfo, size)) return 0;
+    uint64_t saved_blocks = sfo_blocks(sfo, size, "SAVEDATA_BLOCKS");
+    uint64_t system_blocks = sfo_blocks(sfo, size, "SYSTEM_BLOCKS");
+    if (!saved_blocks || system_blocks > UINT64_MAX - saved_blocks) return 0;
+    memset(geometry, 0, sizeof(*geometry));
+    geometry->version = 2;
+    geometry->block_size_bytes = 65536;
+    geometry->block_count = saved_blocks + system_blocks;
+    geometry->original_image_size_bytes = geometry->block_count * 65536;
+    geometry->backup_header_count = 1;
+    geometry->mode_raw = 0x000d;
+    geometry->has_fs_ext = 1;
+    geometry->fs_ext = system_blocks;
+    return chives_geometry_valid(geometry) ? 1 : 0;
+}
+
 static void sfo_text(const uint8_t *sfo, size_t size, const char *field,
                      char *output, size_t capacity, const char *fallback) {
     const uint8_t *value;
@@ -115,7 +147,7 @@ int chives_write_export(const char *image, const char *mount, const char *dest) 
     snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mount);
     static uint8_t sfo[0x8000];
     int sfo_size = read_effective_param_sfo(sfo_path, sfo, sizeof(sfo), NULL);
-    if (sfo_size <= 0) return -1;
+    if (sfo_size < 0) sfo_size = 0;
 
     char title_id[96] = {0}, directory[768] = {0}, format[96] = {0};
     char title_esc[192], directory_esc[1536], format_esc[192];
