@@ -619,6 +619,10 @@ static int process_ppr_derive(worker_config_t *cfg, const char *job_id,
 static uint8_t g_regen_source_sfo[0x8000];
 static uint32_t g_regen_source_sfo_len;
 
+static int validate_copied_files(const char *src, const char *dst,
+                                 const char *src_base, const char *dst_base,
+                                 int preserve_sce_sys);
+
 static int process_decrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir) {
     worker_log(cfg, job_id, "INFO", "Downloading files...");
@@ -757,7 +761,17 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                 return -1;
             }
         }
-        copy_mounted_to_result(result_dir, basename, include_sce_sys);
+        char result_save_dir[MAX_PATH_LEN];
+        snprintf(result_save_dir, sizeof(result_save_dir), "%s/%s", result_dir, basename);
+        if (copy_mounted_to_result(result_dir, basename, include_sce_sys) < 0 ||
+            validate_copied_files(save_get_mount_point(), result_save_dir,
+                                  save_get_mount_point(), result_save_dir,
+                                  !include_sce_sys) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Decrypted output is missing or truncated");
+            save_unmount();
+            unlink(data_path);
+            return -1;
+        }
         if (!detect_is_ps4(data_path)) {
             static uint8_t real_sfo[0x8000];
             int real_sfo_len = read_effective_param_sfo(sfo_path, real_sfo, sizeof(real_sfo), NULL);
@@ -1071,11 +1085,8 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     char original_image[MAX_PATH_LEN];
     snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", files_dir);
-    uint32_t cached_len = ps5param_get_cached_sfo_len();
-    if (cached_len) {
-        g_regen_source_sfo_len = cached_len;
-        memcpy(g_regen_source_sfo, ps5param_get_cached_sfo(), cached_len);
-    }
+    ps5param_capture_for_image(NULL);
+    g_regen_source_sfo_len = 0;
     struct stat original_st;
     if (stat(original_image, &original_st) == 0) {
         int source_size = ps5param_read_sfo(original_image, g_regen_source_sfo,
