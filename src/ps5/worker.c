@@ -974,20 +974,27 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         is_ps4_job = detected_ps4;
     }
 
-    chives_geometry_t sfo_geometry;
-    if (!is_ps4_job && chives_sfo_geometry(files_dir, &sfo_geometry)) {
+    if (!is_ps4_job) {
         char image_path[MAX_PATH_LEN];
         snprintf(image_path, sizeof(image_path), "%s/PS5IMAGE", files_dir);
         struct stat image_st;
-        int has_image = stat(image_path, &image_st) == 0;
-        if (!has_chives || !has_image) {
-            if (!has_chives || memcmp(&original_geometry, &sfo_geometry, sizeof(sfo_geometry)))
-                worker_logf(cfg, job_id, "INFO",
-                            "Recovered PFS geometry from param.sfo: data=%llu system=%llu",
-                            (unsigned long long)(sfo_geometry.block_count - sfo_geometry.fs_ext),
-                            (unsigned long long)sfo_geometry.fs_ext);
-            original_geometry = sfo_geometry;
+        if (stat(image_path, &image_st) == 0) {
+            if (chives_read_image(image_path, &original_geometry) < 0) {
+                worker_log(cfg, job_id, "ERROR", "Cannot read PS5IMAGE geometry");
+                return -1;
+            }
             has_chives = 1;
+        } else {
+            chives_geometry_t sfo_geometry;
+            if (chives_sfo_geometry(files_dir, &sfo_geometry)) {
+                if (!has_chives || memcmp(&original_geometry, &sfo_geometry, sizeof(sfo_geometry)))
+                    worker_logf(cfg, job_id, "INFO",
+                                "Recovered PFS geometry from param.sfo: data=%llu system=%llu",
+                                (unsigned long long)(sfo_geometry.block_count - sfo_geometry.fs_ext),
+                                (unsigned long long)sfo_geometry.fs_ext);
+                original_geometry = sfo_geometry;
+                has_chives = 1;
+            }
         }
     }
 
