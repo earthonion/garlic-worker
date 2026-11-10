@@ -14,6 +14,7 @@
 #include <ps5/kernel.h>
 
 #include "savedata.h"
+#include "metadata_layout.h"
 #include "chives_io.h"
 #include "pfs_rebuild.h"
 #include "util.h"
@@ -325,11 +326,12 @@ int save_create_pfs(const char *image_path, uint64_t size, int exact) {
     return 0;
 }
 
-int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expected) {
+int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expected,
+                           int physical_sfo) {
     if (!expected) return -1;
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
     uint64_t image_size = expected->block_count * (uint64_t)expected->block_size_bytes;
-    int native_allocation = expected->block_size_bytes == 65536;
+    int native_allocation = physical_sfo;
     int fd = open(image_path, O_CREAT | O_TRUNC | O_RDWR, 0777);
     if (fd < 0) return -1;
     int ret = sceFsUfsAllocateSaveData(fd, image_size, native_allocation ? 0x80 : 0, 0);
@@ -350,7 +352,7 @@ int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expe
     sceFsInitCreatePfsSaveDataOpt(&copt);
     copt.blockSize = (int)expected->block_size_bytes;
     copt.flags[1] = native_allocation ? 0 : 0x02;
-    ret = chives_ppr_create(&copt, image_path, image_size, expected);
+    ret = chives_ppr_create(&copt, image_path, image_size, expected, physical_sfo);
     if (ret < 0) {
         unlink(image_path);
         return -3;

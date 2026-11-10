@@ -18,6 +18,7 @@
 #include "zip.h"
 #include "tcp.h"
 #include "savedata.h"
+#include "metadata_layout.h"
 #include "chives_io.h"
 #include "pfs_rebuild.h"
 #include "util.h"
@@ -998,7 +999,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                 return -1;
             }
             has_chives = 1;
-        } else {
+        } else if (!has_chives) {
             chives_geometry_t sfo_geometry;
             if (chives_sfo_geometry(files_dir, &sfo_geometry)) {
                 if (!has_chives || memcmp(&original_geometry, &sfo_geometry, sizeof(sfo_geometry)))
@@ -1109,6 +1110,14 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             }
         }
     }
+    int physical_sfo = 0;
+    if (has_chives) {
+        char check_path[MAX_PATH_LEN];
+        snprintf(check_path, sizeof(check_path), "%s/sce_sys/param.sfo", files_dir);
+        static uint8_t check_sfo[0x8000];
+        int check_len = read_effective_param_sfo(check_path, check_sfo, sizeof(check_sfo), NULL);
+        physical_sfo = check_len > 0 && garlic_legacy_sfo_matches(&original_geometry, check_sfo, check_len);
+    }
     int use_original = !has_chives && !is_ps4_job && has_original_key && original_size > 0 &&
         stat(original_image, &original_st) == 0 &&
         (uint64_t)original_st.st_size == original_size;
@@ -1138,7 +1147,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             }
         } else {
             int created = has_chives
-                ? save_create_pfs_chives(img_path, &original_geometry)
+                ? save_create_pfs_chives(img_path, &original_geometry, physical_sfo)
                 : save_create_pfs(img_path, data_size, saveblocks > 0 || original_size > 0);
             if (created < 0) {
                 worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
