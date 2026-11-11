@@ -209,7 +209,7 @@ static int is_ps5_sidecar(const char *name) {
            strcmp(name, "chives.json") == 0;
 }
 
-static int flatten_single_save_directory(const char *files_dir) {
+static int flatten_single_save_directory(const char *files_dir, char *save_name, size_t save_name_size) {
     for (;;) {
         DIR *root = opendir(files_dir);
         if (!root) return -1;
@@ -229,6 +229,8 @@ static int flatten_single_save_directory(const char *files_dir) {
         snprintf(staging, sizeof(staging), "%s.flatten", files_dir);
         struct stat st;
         if (stat(nested, &st) < 0 || !S_ISDIR(st.st_mode)) return 0;
+        if (save_name && save_name_size && !save_name[0])
+            snprintf(save_name, save_name_size, "%s", only);
         rmdir(staging);
         if (rename(nested,staging) < 0) return -1;
 
@@ -250,7 +252,7 @@ static int flatten_single_save_directory(const char *files_dir) {
 }
 
 static int worker_download_files(worker_config_t *cfg, const char *job_id,
-                                 const char *work_dir) {
+                                 const char *work_dir, char *save_name, size_t save_name_size) {
     char zip_path[MAX_PATH_LEN];
     snprintf(zip_path, sizeof(zip_path), "%s/files.zip", work_dir);
 
@@ -306,7 +308,7 @@ static int worker_download_files(worker_config_t *cfg, const char *job_id,
         return -1;
     }
 
-    if (flatten_single_save_directory(files_dir) < 0) {
+    if (flatten_single_save_directory(files_dir, save_name, save_name_size) < 0) {
         garlic_log("[Garlic] Failed to flatten enclosing save directory\n");
         return -1;
     }
@@ -627,7 +629,7 @@ static int validate_copied_files(const char *src, const char *dst,
 static int process_decrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir) {
     worker_log(cfg, job_id, "INFO", "Downloading files...");
-    if (worker_download_files(cfg, job_id, work_dir) < 0) {
+    if (worker_download_files(cfg, job_id, work_dir, NULL, 0) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to download files");
         return -1;
     }
@@ -795,7 +797,7 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                 unlink(data_path);
                 return -1;
             }
-            if (chives_write_export(data_path, save_get_mount_point(), result_dir) < 0) {
+            if (chives_write_export(data_path, save_get_mount_point(), result_dir, basename) < 0) {
                 worker_log(cfg, job_id, "WARNING", "Failed to export chives.json geometry");
             }
         }
@@ -955,22 +957,19 @@ static int verify_physical_sfo(const char *image_path, const uint8_t *key,
 static int process_encrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir,
                            int is_ps4_job) {
+    char savename[256] = {0};
     worker_log(cfg, job_id, "INFO", "Downloading files...");
-    if (worker_download_files(cfg, job_id, work_dir) < 0) {
+    if (worker_download_files(cfg, job_id, work_dir, savename, sizeof(savename)) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to download files");
         return -1;
     }
 
-    char savename[256] = {0};
     int saveblocks = 0;
     char account_id[64] = {0};
     json_get_string(params, "savename", savename, sizeof(savename));
+    int explicit_savename = savename[0] != '\0';
     json_get_int(params, "saveblocks", &saveblocks);
     json_get_string(params, "account_id", account_id, sizeof(account_id));
-
-    if (!savename[0]) {
-        snprintf(savename, sizeof(savename), "save_%s", job_id);
-    }
 
     char files_dir[MAX_PATH_LEN];
     snprintf(files_dir, sizeof(files_dir), "%s/files", work_dir);
@@ -981,6 +980,10 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         worker_log(cfg, job_id, "ERROR", "Invalid or incompatible chives.json geometry");
         return -1;
     }
+    if (has_chives && !explicit_savename && original_geometry.encrypted_name[0])
+        snprintf(savename, sizeof(savename), "%s", original_geometry.encrypted_name);
+    if (!savename[0])
+        snprintf(savename, sizeof(savename), "save_%s", job_id);
 
     int detected_ps4 = detect_upload_is_ps4(files_dir);
     if (detected_ps4 >= 0 && detected_ps4 != is_ps4_job) {
@@ -1111,16 +1114,27 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         }
     }
     int physical_sfo = 0;
+    const uint8_t *cow_sfo = NULL;
+    uint32_t cow_sfo_len = 0;
     if (has_chives) {
         char check_path[MAX_PATH_LEN];
         snprintf(check_path, sizeof(check_path), "%s/sce_sys/param.sfo", files_dir);
         static uint8_t check_sfo[0x8000];
         int check_len = read_effective_param_sfo(check_path, check_sfo, sizeof(check_sfo), NULL);
         physical_sfo = check_len > 0 && garlic_legacy_sfo_matches(&original_geometry, check_sfo, check_len);
+        if (original_geometry.fs_ext) {
+            cow_sfo = g_regen_source_sfo_len ? g_regen_source_sfo : check_sfo;
+            cow_sfo_len = g_regen_source_sfo_len ? g_regen_source_sfo_len
+                                                 : (check_len > 0 ? (uint32_t)check_len : 0);
+        }
     }
-    int use_original = !has_chives && !is_ps4_job && has_original_key && original_size > 0 &&
-        stat(original_image, &original_st) == 0 &&
+    int use_original = (!has_chives || original_geometry.fs_ext) && !is_ps4_job &&
+        has_original_key && original_size > 0 && stat(original_image, &original_st) == 0 &&
         (uint64_t)original_st.st_size == original_size;
+    if (!is_ps4_job && original_geometry.fs_ext && !use_original) {
+        worker_log(cfg, job_id, "ERROR", "CoW encryption requires the original PS5IMAGE and PS5KEY");
+        return -1;
+    }
 
     if (use_original) {
         worker_log(cfg, job_id, "INFO", "Reusing original PS5 PFS image...");
@@ -1183,16 +1197,17 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         worker_logf(cfg, job_id, "INFO", "Zeroed SFO detected; cached original SFO length=%u",
                     g_regen_source_sfo_len);
     preserve_sidecar = use_original && has_sidecar && upload_zero_sfo;
+    if (!is_ps4_job && original_geometry.fs_ext) unlink(uploaded_sfo);
     int copy_result;
     if (!is_ps4_job) {
-        copy_result = copy_dir_recursive(files_dir, mnt);
+        copy_result = copy_dir_pfs(files_dir, mnt);
     } else if (use_original && !upload_zero_sfo) {
         copy_result = copy_dir_pfs_preserve_sce_sys(files_dir, mnt);
     } else {
         copy_result = copy_dir_pfs(files_dir, mnt);
     }
     if (copy_result < 0) {
-        worker_log(cfg, job_id, "ERROR", "Failed to copy files into PFS (out of space?)");
+        worker_log(cfg, job_id, "ERROR", "Failed to copy files into PFS");
         save_unmount();
         return -1;
     }
@@ -1206,7 +1221,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
             return -1;
         }
     }
-    if (upload_zero_sfo && (!has_sidecar || !use_original) &&
+    if (upload_zero_sfo && !original_geometry.fs_ext && (!has_sidecar || !use_original) &&
         restore_zero_sfo_from_cache(mnt) < 0) {
         worker_log(cfg, job_id, "ERROR",
                    "Zeroed param.sfo requires a compatible original image, PS5PARAM blob and PS5KEY");
@@ -1236,7 +1251,15 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     /* PS5: capture the final SFO (with any account patch) for the blob */
     uint8_t enc_sfo[0x8000];
     uint32_t enc_sfo_len = 0;
-    if (!is_ps4_job) {
+    if (!is_ps4_job && original_geometry.fs_ext && cow_sfo_len) {
+        memcpy(enc_sfo, cow_sfo, cow_sfo_len);
+        enc_sfo_len = cow_sfo_len;
+        if (account_id[0] && !preserve_sidecar) {
+            uint8_t new_aid[8];
+            if (account_id_to_sfo_bytes(account_id, new_aid) == 0)
+                memcpy(enc_sfo + SFO_AID_OFFSET_PS5, new_aid, sizeof(new_aid));
+        }
+    } else if (!is_ps4_job) {
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
         int rfd = open(sfo_path, O_RDONLY);
@@ -1355,7 +1378,7 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
     }
 
     worker_log(cfg, job_id, "INFO", "Downloading files...");
-    if (worker_download_files(cfg, job_id, work_dir) < 0) {
+    if (worker_download_files(cfg, job_id, work_dir, NULL, 0) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to download files");
         return -1;
     }
@@ -1506,7 +1529,7 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
     }
 
     worker_log(cfg, job_id, "INFO", "Downloading files...");
-    if (worker_download_files(cfg, job_id, work_dir) < 0) {
+    if (worker_download_files(cfg, job_id, work_dir, NULL, 0) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to download files");
         return -1;
     }

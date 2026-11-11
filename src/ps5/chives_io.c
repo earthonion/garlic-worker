@@ -140,7 +140,8 @@ static size_t json_escape(const char *input, char *output, size_t capacity) {
     return used;
 }
 
-int chives_write_export(const char *image, const char *mount, const char *dest) {
+int chives_write_export(const char *image, const char *mount, const char *dest,
+                        const char *encrypted_name) {
     chives_geometry_t geometry;
     if (chives_read_image(image, &geometry) < 0) return -1;
     char sfo_path[MAX_PATH_LEN];
@@ -150,25 +151,27 @@ int chives_write_export(const char *image, const char *mount, const char *dest) 
     if (sfo_size < 0) sfo_size = 0;
 
     char title_id[96] = {0}, directory[768] = {0}, format[96] = {0};
-    char title_esc[192], directory_esc[1536], format_esc[192];
+    char title_esc[192], directory_esc[1536], format_esc[192], name_esc[512];
     sfo_text(sfo, (size_t)sfo_size, "TITLE_ID", title_id, sizeof(title_id), "");
     sfo_text(sfo, (size_t)sfo_size, "SAVEDATA_DIRECTORY", directory, sizeof(directory), "");
     sfo_text(sfo, (size_t)sfo_size, "FORMAT", format, sizeof(format), "ppr");
     json_escape(title_id, title_esc, sizeof(title_esc));
     json_escape(directory, directory_esc, sizeof(directory_esc));
     json_escape(format, format_esc, sizeof(format_esc));
+    json_escape(encrypted_name, name_esc, sizeof(name_esc));
     uint64_t saved_blocks = sfo_blocks(sfo, (size_t)sfo_size, "SAVEDATA_BLOCKS");
     uint64_t system_blocks = sfo_blocks(sfo, (size_t)sfo_size, "SYSTEM_BLOCKS");
-    char json[2048];
+    char json[3072];
     int length = snprintf(json, sizeof(json),
         "{\n  \"schema_version\": 1,\n  \"platform\": \"PS5\",\n"
         "  \"title_id\": \"%s\",\n  \"save_directory\": \"%s\",\n"
-        "  \"save_format\": \"%s\",\n  \"original_image_size_bytes\": %llu,\n"
+        "  \"save_format\": \"%s\",\n  \"encrypted_name\": \"%s\",\n"
+        "  \"original_image_size_bytes\": %llu,\n"
         "  \"pfs\": {\n    \"version\": %llu,\n    \"block_size_bytes\": %u,\n"
         "    \"block_count\": %llu,\n    \"mode_raw\": %u,\n"
         "    \"backup_header_count\": %u, \"fs_ext\": %u\n  },\n"
         "  \"sfo\": {\"savedata_blocks\": %llu, \"system_blocks\": %llu}\n}\n",
-        title_esc, directory_esc, format_esc,
+        title_esc, directory_esc, format_esc, name_esc,
         (unsigned long long)geometry.original_image_size_bytes,
         (unsigned long long)geometry.version, geometry.block_size_bytes,
         (unsigned long long)geometry.block_count, geometry.mode_raw,

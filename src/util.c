@@ -34,9 +34,10 @@ void delete_recursive(const char *path) {
 int copy_file(const char *src, const char *dst) {
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) return -1;
-    int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0777);
+    int dfd = open(dst, O_CREAT | O_WRONLY, 0777);
     if (dfd < 0) { close(sfd); return -2; }
     char buf[BUF_SIZE];
+    off_t total = 0;
     ssize_t n;
     while ((n = read(sfd, buf, sizeof(buf))) > 0) {
         ssize_t written = 0;
@@ -45,7 +46,9 @@ int copy_file(const char *src, const char *dst) {
             if (w <= 0) { close(sfd); close(dfd); return -3; }
             written += w;
         }
+        total += n;
     }
+    if (n < 0 || ftruncate(dfd, total) < 0) { close(sfd); close(dfd); return -4; }
     fsync(dfd);
     /* Force mode 0777 regardless of umask — the game verifies save file mode
      * and flags 0775 (world-write stripped by default umask=022) as corrupt. */
@@ -120,11 +123,7 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
         if (*relpath == '/') relpath++;
         if (preserve_sce_sys && _is_sce_sys_path(relpath)) continue;
 
-        /* sce_sys and memory.dat → uid 0, everything else → uid 1 */
-        if (_is_sce_sys_path(relpath) || strcmp(ent->d_name, "memory.dat") == 0)
-            setuid(0);
-        else
-            setuid(1);
+        uid_t owner = (_is_sce_sys_path(relpath) || strcmp(ent->d_name, "memory.dat") == 0) ? 0 : 1;
 
         struct stat st;
         if (stat(sp, &st) < 0) continue;
@@ -132,21 +131,19 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
         if (S_ISDIR(st.st_mode)) {
             r = _copy_pfs_recursive(sp, dp, src_base, preserve_sce_sys);
         } else {
-            /* Create file first (like cecie.nim does) */
             int fd = open(dp, O_CREAT | O_TRUNC, 0777);
             if (fd >= 0) close(fd);
             r = copy_file(sp, dp);
         }
+        if (r >= 0 && chown(dp, owner, 0) < 0) r = -4;
         if (r < 0) {
             fprintf(stderr, "[_copy_pfs_recursive] %s -> %s failed (rc=%d errno=%d)\n",
                     sp, dp, r, errno);
             closedir(d);
-            setuid(0);
             return r;
         }
     }
     closedir(d);
-    setuid(0);
     return 0;
 }
 
