@@ -18,6 +18,7 @@
 #include "zip.h"
 #include "tcp.h"
 #include "savedata.h"
+#include "sfo_account.h"
 #include "metadata_layout.h"
 #include "chives_io.h"
 #include "pfs_rebuild.h"
@@ -123,18 +124,40 @@ static void worker_self_update(worker_config_t *cfg) {
 }
 
 #define WORK_BASE      "/data/garlic/work"
-/* PS4 and PS5 save files use different param.sfo key tables, so the
- * ACCOUNT_ID byte offset differs. Pick by save type at patch time. */
-#define SFO_AID_OFFSET     0x1B8  /* default: PS5 param.sfo */
-#define SFO_AID_OFFSET_PS5 0x1B8
-#define SFO_AID_OFFSET_PS4 0x15C
 #define KEYSTONE_SIZE  0x400
 
 static int account_id_to_sfo_bytes(const char *hex, uint8_t out[8]) {
-    uint8_t be[8];
-    if (hex_to_bytes(hex, be, 8) != 8) return -1;
-    for (int i = 0; i < 8; i++) out[i] = be[7 - i];
-    return 0;
+    return sfo_account_from_hex(hex, out);
+}
+
+static int patch_sfo_account_bytes(uint8_t *sfo, size_t size, const uint8_t account[8]) {
+    if (!sfo || size < 20 || memcmp(sfo, "\0PSF", 4)) return -1;
+    uint32_t keys, data, count;
+    memcpy(&keys, sfo + 8, 4);
+    memcpy(&data, sfo + 12, 4);
+    memcpy(&count, sfo + 16, 4);
+    if (count > (size - 20) / 16 || keys < 20 + count * 16 || keys >= data || data > size)
+        return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *entry = sfo + 20 + i * 16;
+        uint16_t key;
+        uint32_t length, capacity, offset;
+        memcpy(&key, entry, 2);
+        memcpy(&length, entry + 4, 4);
+        memcpy(&capacity, entry + 8, 4);
+        memcpy(&offset, entry + 12, 4);
+        uint64_t key_pos = (uint64_t)keys + key;
+        uint64_t value_pos = (uint64_t)data + offset;
+        if (key_pos >= data || length > capacity || value_pos > size ||
+            capacity > size - value_pos) return -1;
+        static const char name[] = "ACCOUNT_ID";
+        if (sizeof(name) > data - key_pos || memcmp(sfo + key_pos, name, sizeof(name)))
+            continue;
+        if (length < 8 || value_pos > size || 8 > size - value_pos) return -1;
+        memcpy(sfo + value_pos, account, 8);
+        return memcmp(sfo + value_pos, account, 8) ? -1 : 0;
+    }
+    return -1;
 }
 
 /* ── Transport mode (0=HTTP, 1=TCP) ────────────────────────────── */
@@ -997,10 +1020,16 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         snprintf(image_path, sizeof(image_path), "%s/PS5IMAGE", files_dir);
         struct stat image_st;
         if (stat(image_path, &image_st) == 0) {
+            chives_geometry_t json_geometry = original_geometry;
             if (chives_read_image(image_path, &original_geometry) < 0) {
                 worker_log(cfg, job_id, "ERROR", "Cannot read PS5IMAGE geometry");
                 return -1;
             }
+            snprintf(original_geometry.encrypted_name, sizeof(original_geometry.encrypted_name),
+                     "%s", json_geometry.encrypted_name);
+            original_geometry.ownership_count = json_geometry.ownership_count;
+            memcpy(original_geometry.ownership, json_geometry.ownership,
+                   sizeof(original_geometry.ownership));
             has_chives = 1;
         } else if (!has_chives) {
             chives_geometry_t sfo_geometry;
@@ -1139,7 +1168,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     if (use_original) {
         worker_log(cfg, job_id, "INFO", "Reusing original PS5 PFS image...");
         if (copy_file(original_image, img_path) < 0 ||
-            save_mount_new(img_path, original_key) < 0) {
+            save_mount_new(img_path, has_original_key ? original_key : NULL) < 0) {
             worker_log(cfg, job_id, "ERROR", "Failed to mount original PFS image");
             unlink(img_path);
             return -1;
@@ -1167,7 +1196,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                 worker_log(cfg, job_id, "ERROR", "Failed to create PFS image");
                 return -1;
             }
-            if (save_mount_new(img_path, original_key) < 0) {
+            if (save_mount_new(img_path, has_original_key ? original_key : NULL) < 0) {
                 worker_log(cfg, job_id, "ERROR", "Failed to mount new PFS");
                 unlink(img_path);
                 return -1;
@@ -1200,7 +1229,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     if (!is_ps4_job && original_geometry.fs_ext) unlink(uploaded_sfo);
     int copy_result;
     if (!is_ps4_job) {
-        copy_result = copy_dir_pfs(files_dir, mnt);
+        copy_result = copy_dir_pfs_with_geometry(files_dir, mnt, has_chives ? &original_geometry : NULL);
     } else if (use_original && !upload_zero_sfo) {
         copy_result = copy_dir_pfs_preserve_sce_sys(files_dir, mnt);
     } else {
@@ -1230,21 +1259,20 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     }
 
     if (account_id[0] && !upload_zero_sfo) preserve_sidecar = 0;
-    /* Patch account ID if provided */
-    if (account_id[0] && !preserve_sidecar) {
-        uint8_t new_aid[8];
-        if (account_id_to_sfo_bytes(account_id, new_aid) == 0) {
-            char sfo_path[MAX_PATH_LEN];
-            snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
-            int sfo_fd = open(sfo_path, O_RDWR);
-            if (sfo_fd >= 0) {
-                pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
-                close(sfo_fd);
-                sync();
-                worker_logf(cfg, job_id, "INFO", "Patched account ID (%02x%02x%02x%02x%02x%02x%02x%02x)",
-                            new_aid[0], new_aid[1], new_aid[2], new_aid[3],
-                            new_aid[4], new_aid[5], new_aid[6], new_aid[7]);
-            }
+    uint8_t new_aid[8];
+    int patch_account = account_id[0] && !preserve_sidecar;
+    if (patch_account && account_id_to_sfo_bytes(account_id, new_aid) < 0) {
+        worker_log(cfg, job_id, "ERROR", "Invalid account_id format");
+        save_unmount();
+        return -1;
+    }
+    if (patch_account && (is_ps4_job || !original_geometry.fs_ext)) {
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
+        if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to write and verify Account ID in param.sfo");
+            save_unmount();
+            return -1;
         }
     }
 
@@ -1254,10 +1282,10 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     if (!is_ps4_job && original_geometry.fs_ext && cow_sfo_len) {
         memcpy(enc_sfo, cow_sfo, cow_sfo_len);
         enc_sfo_len = cow_sfo_len;
-        if (account_id[0] && !preserve_sidecar) {
-            uint8_t new_aid[8];
-            if (account_id_to_sfo_bytes(account_id, new_aid) == 0)
-                memcpy(enc_sfo + SFO_AID_OFFSET_PS5, new_aid, sizeof(new_aid));
+        if (patch_account && patch_sfo_account_bytes(enc_sfo, enc_sfo_len, new_aid) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to write and verify Account ID in param.sfo");
+            save_unmount();
+            return -1;
         }
     } else if (!is_ps4_job) {
         char sfo_path[MAX_PATH_LEN];
@@ -1333,7 +1361,12 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     char result_save[MAX_PATH_LEN];
     snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, savename);
-    copy_file(img_path, result_save);
+    if (copy_file(img_path, result_save) < 0) {
+        worker_log(cfg, job_id, "ERROR", "Failed to copy finalized save to the result");
+        unlink(result_save);
+        unlink(img_path);
+        return -1;
+    }
     unlink(img_path);
 
     /* PS4: include the companion sealed-key .bin in the result zip */
@@ -1341,7 +1374,13 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
         char src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
         snprintf(src_bin, sizeof(src_bin), "%s.bin", img_path);
         snprintf(dst_bin, sizeof(dst_bin), "%s.bin", result_save);
-        copy_file(src_bin, dst_bin);
+        if (copy_file(src_bin, dst_bin) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to copy the PS4 sealed-key companion");
+            unlink(result_save);
+            unlink(dst_bin);
+            unlink(src_bin);
+            return -1;
+        }
         unlink(src_bin);
     }
 
@@ -1436,14 +1475,11 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
                              ps5param_get_cached_sfo_len());
         }
 
-        /* Patch account ID */
-        int sfo_fd = open(sfo_path, O_RDWR);
-        if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
-            close(sfo_fd);
-            sync();
-        } else {
-            worker_logf(cfg, job_id, "WARNING", "Cannot open param.sfo for %s", basename);
+        if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot patch and verify param.sfo for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            continue;
         }
 
         /* PS5: read back the patched SFO for the blob write-back */
@@ -1457,19 +1493,30 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
                 if (rn > 0 && sfo_bytes_valid(resign_sfo, (size_t)rn))
                     resign_sfo_len = (uint32_t)rn;
             }
+            if (!resign_sfo_len) {
+                worker_logf(cfg, job_id, "WARNING", "Cannot read final param.sfo for %s", basename);
+                save_unmount();
+                unlink(data_path);
+                continue;
+            }
         }
 
-        save_unmount();
+        if (save_unmount() < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot finalize %s", basename);
+            unlink(data_path);
+            continue;
+        }
 
         /* PS5: write the resigned SFO back into the header blob */
         if (resign_sfo_len) {
             int wr = ps5param_write_sfo(data_path, resign_sfo, resign_sfo_len);
-            if (wr < 0)
-                worker_logf(cfg, job_id, "WARNING",
-                            "PS5PARAM blob write failed (%d); patched SFO in PFS only", wr);
-            else
-                worker_logf(cfg, job_id, "INFO",
-                            "PS5PARAM: wrote resigned param.sfo (%u B) into blob", resign_sfo_len);
+            if (wr < 0) {
+                worker_logf(cfg, job_id, "WARNING", "PS5PARAM blob write failed for %s (%d)", basename, wr);
+                unlink(data_path);
+                continue;
+            }
+            worker_logf(cfg, job_id, "INFO",
+                        "PS5PARAM: wrote resigned param.sfo (%u B) into blob", resign_sfo_len);
         }
 
         /* Copy resigned save to result. For PS4 saves, the companion .bin
@@ -1477,14 +1524,26 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
          * but must travel with the image so the user can put both back. */
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
-        copy_file(data_path, result_save);
+        if (copy_file(data_path, result_save) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to copy resigned %s to the result", basename);
+            unlink(result_save);
+            unlink(data_path);
+            continue;
+        }
 
         char src_bin[MAX_PATH_LEN];
         snprintf(src_bin, sizeof(src_bin), "%s.bin", data_path);
         if (access(src_bin, R_OK) == 0) {
             char dst_bin[MAX_PATH_LEN];
             snprintf(dst_bin, sizeof(dst_bin), "%s.bin", result_save);
-            copy_file(src_bin, dst_bin);
+            if (copy_file(src_bin, dst_bin) < 0) {
+                worker_logf(cfg, job_id, "WARNING", "Failed to copy the companion for %s", basename);
+                unlink(result_save);
+                unlink(dst_bin);
+                unlink(src_bin);
+                unlink(data_path);
+                continue;
+            }
             unlink(src_bin);
         }
         unlink(data_path);
@@ -1646,20 +1705,24 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
                              ps5param_get_cached_sfo_len());
         }
 
-        /* Patch account ID */
-        int sfo_fd = open(sfo_path, O_RDWR);
-        if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, is_ps4_job ? SFO_AID_OFFSET_PS4 : SFO_AID_OFFSET_PS5);
-            close(sfo_fd);
+        if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot patch and verify param.sfo for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            continue;
         }
 
         /* Write keystone */
         char ks_out[MAX_PATH_LEN];
         snprintf(ks_out, sizeof(ks_out), "%s/sce_sys/keystone", mnt);
         int ks_fd = open(ks_out, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-        if (ks_fd >= 0) {
-            write(ks_fd, keystone, KEYSTONE_SIZE);
-            close(ks_fd);
+        ssize_t ks_written = ks_fd >= 0 ? write(ks_fd, keystone, KEYSTONE_SIZE) : -1;
+        if (ks_fd >= 0) close(ks_fd);
+        if (ks_written != KEYSTONE_SIZE) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot write complete keystone for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            continue;
         }
         sync();
 
@@ -1674,21 +1737,38 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
                 if (rn > 0 && sfo_bytes_valid(rereg_sfo, (size_t)rn))
                     rereg_sfo_len = (uint32_t)rn;
             }
+            if (!rereg_sfo_len) {
+                worker_logf(cfg, job_id, "WARNING", "Cannot read final param.sfo for %s", basename);
+                save_unmount();
+                unlink(data_path);
+                continue;
+            }
         }
 
-        save_unmount();
+        if (save_unmount() < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot finalize %s", basename);
+            unlink(data_path);
+            continue;
+        }
 
         /* PS5: write patched SFO back to blob */
         if (rereg_sfo_len) {
             int wr = ps5param_write_sfo(data_path, rereg_sfo, rereg_sfo_len);
-            if (wr < 0)
-                worker_logf(cfg, job_id, "WARNING",
-                            "PS5PARAM blob write failed (%d)", wr);
+            if (wr < 0) {
+                worker_logf(cfg, job_id, "WARNING", "PS5PARAM blob write failed for %s (%d)", basename, wr);
+                unlink(data_path);
+                continue;
+            }
         }
 
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
-        copy_file(data_path, result_save);
+        if (copy_file(data_path, result_save) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to copy reregioned %s to the result", basename);
+            unlink(result_save);
+            unlink(data_path);
+            continue;
+        }
         unlink(data_path);
         processed++;
     }

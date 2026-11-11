@@ -9,6 +9,7 @@
 #include <sys/types.h>
 
 #include "util.h"
+#include "../ps5/chives.h"
 
 void delete_recursive(const char *path) {
     DIR *d = opendir(path);
@@ -105,8 +106,32 @@ static int _is_sce_sys_path(const char *relpath) {
            (relpath[7] == '/' || relpath[7] == '\0');
 }
 
+typedef struct {
+    uid_t uid;
+    gid_t gid;
+    mode_t mode;
+} pfs_metadata_t;
+
+static pfs_metadata_t pfs_metadata_for_path(const char *relpath,
+                                             const chives_geometry_t *geometry) {
+    pfs_metadata_t metadata = {.uid = 1, .gid = 0, .mode = 0777};
+    if (_is_sce_sys_path(relpath) || !strcmp(relpath, "memory.dat")) metadata.uid = 0;
+    if (geometry) {
+        for (uint32_t i = 0; i < geometry->ownership_count; i++) {
+            if (!strcmp(relpath, geometry->ownership[i].path)) {
+                metadata.uid = geometry->ownership[i].uid;
+                metadata.gid = geometry->ownership[i].gid;
+                metadata.mode = geometry->ownership[i].mode;
+                break;
+            }
+        }
+    }
+    return metadata;
+}
+
 static int _copy_pfs_recursive(const char *src, const char *dst,
-                                const char *src_base, int preserve_sce_sys) {
+                                const char *src_base, int preserve_sce_sys,
+                                const chives_geometry_t *geometry) {
     mkdir(dst, 0777);
     DIR *d = opendir(src);
     if (!d) return -1;
@@ -123,19 +148,19 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
         if (*relpath == '/') relpath++;
         if (preserve_sce_sys && _is_sce_sys_path(relpath)) continue;
 
-        uid_t owner = (_is_sce_sys_path(relpath) || strcmp(ent->d_name, "memory.dat") == 0) ? 0 : 1;
-
+        pfs_metadata_t metadata = pfs_metadata_for_path(relpath, geometry);
         struct stat st;
         if (stat(sp, &st) < 0) continue;
         int r;
         if (S_ISDIR(st.st_mode)) {
-            r = _copy_pfs_recursive(sp, dp, src_base, preserve_sce_sys);
+            r = _copy_pfs_recursive(sp, dp, src_base, preserve_sce_sys, geometry);
         } else {
             int fd = open(dp, O_CREAT | O_TRUNC, 0777);
             if (fd >= 0) close(fd);
             r = copy_file(sp, dp);
         }
-        if (r >= 0 && chown(dp, owner, 0) < 0) r = -4;
+        if (r >= 0 && (chown(dp, metadata.uid, metadata.gid) < 0 ||
+                       chmod(dp, metadata.mode) < 0)) r = -4;
         if (r < 0) {
             fprintf(stderr, "[_copy_pfs_recursive] %s -> %s failed (rc=%d errno=%d)\n",
                     sp, dp, r, errno);
@@ -148,16 +173,19 @@ static int _copy_pfs_recursive(const char *src, const char *dst,
 }
 
 int copy_dir_pfs(const char *src, const char *dst) {
-    /* Umask 0 so 0777 mkdir/open modes come through un-masked.  Default
-     * process umask 022/002 strips world-write from files, producing 0775
-     * dir/file modes that the game rejects as corrupt savedata. */
     umask(0);
-    return _copy_pfs_recursive(src, dst, src, 0);
+    return _copy_pfs_recursive(src, dst, src, 0, NULL);
+}
+
+int copy_dir_pfs_with_geometry(const char *src, const char *dst,
+                               const chives_geometry_t *geometry) {
+    umask(0);
+    return _copy_pfs_recursive(src, dst, src, 0, geometry);
 }
 
 int copy_dir_pfs_preserve_sce_sys(const char *src, const char *dst) {
     umask(0);
-    return _copy_pfs_recursive(src, dst, src, 1);
+    return _copy_pfs_recursive(src, dst, src, 1, NULL);
 }
 
 int hex_to_bytes(const char *hex, uint8_t *out, int max_bytes) {

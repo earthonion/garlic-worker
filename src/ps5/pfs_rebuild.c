@@ -21,8 +21,7 @@
 #define MAX_PATH_LEN CMP_PATH_BYTES
 
 static int ppr_create(CreateOpt *opt, const char *path, int x, uint64_t size) {
-    uint8_t key[0x20] = {0};
-    return g_pprCreate(opt, path, x, size, key);
+    return g_pprCreate(opt, path, x, size);
 }
 
 /* Physical-SFO creation provenance is separate from the mount cache: native

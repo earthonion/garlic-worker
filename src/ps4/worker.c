@@ -15,11 +15,11 @@
 #include "zip.h"
 #include "tcp.h"
 #include "savedata.h"
+#include "sfo_account.h"
 #include "util.h"
 #include "log.h"
 
 #define WORK_BASE      "/data/garlic/work"
-#define SFO_AID_OFFSET 0x15C   /* PS4 account ID offset in param.sfo */
 #define KEYSTONE_SIZE  0x400
 
 #define WORKER_PLATFORM "ps4"
@@ -506,20 +506,21 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     /* Patch account ID if provided */
     if (account_id[0]) {
         uint8_t new_aid[8];
-        if (hex_to_bytes(account_id, new_aid, 8) == 8) {
-            char sfo_path[MAX_PATH_LEN];
-            snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
-            int sfo_fd = open(sfo_path, O_RDWR);
-            if (sfo_fd >= 0) {
-                pwrite(sfo_fd, new_aid, 8, SFO_AID_OFFSET);
-                close(sfo_fd);
-                sync();
-                worker_log(cfg, job_id, "INFO", "Patched account ID");
-            }
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
+        if (sfo_account_from_hex(account_id, new_aid) < 0 ||
+            patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+            worker_log(cfg, job_id, "ERROR", "Failed to write and verify Account ID in param.sfo");
+            save_unmount();
+            return -1;
         }
+        worker_log(cfg, job_id, "INFO", "Patched and verified account ID");
     }
 
-    save_unmount();
+    if (save_unmount() < 0) {
+        worker_log(cfg, job_id, "ERROR", "Cannot finalize save: unmount failed");
+        return -1;
+    }
 
     /* Copy result to result dir and zip.
      * For PS4, encrypt produces both the save file and a .bin sealed key. */
@@ -529,14 +530,25 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     char result_save[MAX_PATH_LEN];
     snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, savename);
-    copy_file(img_path, result_save);
+    if (copy_file(img_path, result_save) < 0) {
+        worker_log(cfg, job_id, "ERROR", "Failed to copy finalized save to the result");
+        unlink(result_save);
+        unlink(img_path);
+        return -1;
+    }
     unlink(img_path);
 
     /* Copy .bin sealed key companion if it exists */
     char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
     snprintf(bin_src, sizeof(bin_src), "%s.bin", img_path);
     snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", result_dir, savename);
-    copy_file(bin_src, bin_dst);
+    if (copy_file(bin_src, bin_dst) < 0) {
+        worker_log(cfg, job_id, "ERROR", "Failed to copy the PS4 sealed-key companion");
+        unlink(result_save);
+        unlink(bin_dst);
+        unlink(bin_src);
+        return -1;
+    }
     unlink(bin_src);
 
     worker_log(cfg, job_id, "INFO", "Uploading result...");
@@ -565,7 +577,7 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
     }
 
     uint8_t new_aid[8];
-    if (hex_to_bytes(account_id, new_aid, 8) != 8) {
+    if (sfo_account_from_hex(account_id, new_aid) < 0) {
         worker_log(cfg, job_id, "ERROR", "Invalid account_id format");
         return -1;
     }
@@ -630,24 +642,34 @@ static int process_resign(worker_config_t *cfg, const char *job_id,
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo",
                  save_get_mount_point());
-        int sfo_fd = open(sfo_path, O_RDWR);
-        if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, SFO_AID_OFFSET);
-            close(sfo_fd);
-            sync();
-        } else {
-            worker_logf(cfg, job_id, "WARNING", "Cannot open param.sfo for %s", basename);
+        if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot patch and verify param.sfo for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
         }
 
-        save_unmount();
+        if (save_unmount() < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot finalize %s", basename);
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
+        }
 
         /* Copy resigned save + .bin to result */
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
-        copy_file(data_path, result_save);
         char result_bin[MAX_PATH_LEN];
         snprintf(result_bin, sizeof(result_bin), "%s/%s.bin", result_dir, basename);
-        copy_file(bin_dst, result_bin);
+        if (copy_file(data_path, result_save) < 0 || copy_file(bin_dst, result_bin) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to copy resigned %s to the result", basename);
+            unlink(result_save);
+            unlink(result_bin);
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
+        }
         unlink(data_path);
         unlink(bin_dst);
         processed++;
@@ -684,7 +706,7 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
     }
 
     uint8_t new_aid[8];
-    if (hex_to_bytes(account_id, new_aid, 8) != 8) {
+    if (sfo_account_from_hex(account_id, new_aid) < 0) {
         worker_log(cfg, job_id, "ERROR", "Invalid account_id format");
         return -1;
     }
@@ -804,31 +826,49 @@ static int process_reregion(worker_config_t *cfg, const char *job_id,
         /* Patch account ID */
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
-        int sfo_fd = open(sfo_path, O_RDWR);
-        if (sfo_fd >= 0) {
-            pwrite(sfo_fd, new_aid, 8, SFO_AID_OFFSET);
-            close(sfo_fd);
+        if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot patch and verify param.sfo for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
         }
 
         /* Write keystone */
         char ks_out[MAX_PATH_LEN];
         snprintf(ks_out, sizeof(ks_out), "%s/sce_sys/keystone", mnt);
         int ks_fd = open(ks_out, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-        if (ks_fd >= 0) {
-            write(ks_fd, keystone, KEYSTONE_SIZE);
-            close(ks_fd);
+        ssize_t ks_written = ks_fd >= 0 ? write(ks_fd, keystone, KEYSTONE_SIZE) : -1;
+        if (ks_fd >= 0) close(ks_fd);
+        if (ks_written != KEYSTONE_SIZE) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot write complete keystone for %s", basename);
+            save_unmount();
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
         }
         sync();
 
-        save_unmount();
+        if (save_unmount() < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Cannot finalize %s", basename);
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
+        }
 
         /* Copy result save + .bin */
         char result_save[MAX_PATH_LEN];
         snprintf(result_save, sizeof(result_save), "%s/%s", result_dir, basename);
-        copy_file(data_path, result_save);
         char result_bin[MAX_PATH_LEN];
         snprintf(result_bin, sizeof(result_bin), "%s/%s.bin", result_dir, basename);
-        copy_file(bin_dst, result_bin);
+        if (copy_file(data_path, result_save) < 0 || copy_file(bin_dst, result_bin) < 0) {
+            worker_logf(cfg, job_id, "WARNING", "Failed to copy reregioned %s to the result", basename);
+            unlink(result_save);
+            unlink(result_bin);
+            unlink(data_path);
+            unlink(bin_dst);
+            continue;
+        }
         unlink(data_path);
         unlink(bin_dst);
         processed++;

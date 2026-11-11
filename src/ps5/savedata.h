@@ -10,7 +10,7 @@ typedef struct { uint8_t dummy; } UmountOpt;
 typedef struct { int blockSize; uint8_t flags[2]; } CreateOpt;
 
 /* sceFsCreatePprPfsSaveDataImage - loaded via dlsym */
-typedef int (*PprCreateFn)(CreateOpt *opt, const char *path, int x, uint64_t size, uint8_t *key);
+typedef int (*PprCreateFn)(CreateOpt *opt, const char *path, int x, uint64_t size);
 
 extern PprCreateFn g_pprCreate;
 
@@ -62,7 +62,7 @@ int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expe
  * Returns 0 on success. */
 int save_create_pfs_ps4(const char *image_path, uint64_t data_size);
 
-/* Mount a freshly created PFS image with zeroed key.
+/* Mount a freshly created PFS image with the supplied or recovered image key.
  * Returns 0 on success. */
 int save_mount_new(const char *image_path, const uint8_t *key);
 

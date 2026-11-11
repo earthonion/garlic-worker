@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -140,6 +141,65 @@ static size_t json_escape(const char *input, char *output, size_t capacity) {
     return used;
 }
 
+static int chives_collect_ownership(const char *base, const char *relative,
+                                    chives_geometry_t *g) {
+    char directory[MAX_PATH_LEN];
+    if (relative[0]) snprintf(directory,sizeof(directory),"%s/%s",base,relative);
+    else snprintf(directory,sizeof(directory),"%s",base);
+    DIR *d = opendir(directory);
+    if (!d) return -1;
+    struct dirent *ent;
+    int result = 0;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.' && (!ent->d_name[1] ||
+            (ent->d_name[1] == '.' && !ent->d_name[2]))) continue;
+        char child[MAX_PATH_LEN], full[MAX_PATH_LEN];
+        if (relative[0]) snprintf(child,sizeof(child),"%s/%s",relative,ent->d_name);
+        else snprintf(child,sizeof(child),"%s",ent->d_name);
+        if (!chives_path_safe(child) ||
+            snprintf(full,sizeof(full),"%s/%s",directory,ent->d_name) >= (int)sizeof(full)) {
+            result = -1;
+            break;
+        }
+        struct stat st;
+        if (lstat(full,&st) < 0 || g->ownership_count >= CHIVES_MAX_OWNERSHIP) {
+            result = -1;
+            break;
+        }
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) continue;
+        chives_ownership_t *entry = &g->ownership[g->ownership_count++];
+        snprintf(entry->path,sizeof(entry->path),"%s",child);
+        entry->uid = st.st_uid;
+        entry->gid = st.st_gid;
+        entry->mode = st.st_mode & 07777;
+        if (S_ISDIR(st.st_mode) && chives_collect_ownership(directory,child,g) < 0) {
+            result = -1;
+            break;
+        }
+    }
+    closedir(d);
+    return result;
+}
+static int chives_append_ownership(char *json, size_t cap, int n, const chives_geometry_t *g) {
+    if (n < 2 || (size_t)n >= cap || !g->ownership_count) return n;
+    n -= 2;
+    int written = snprintf(json+n,cap-n,",\n  \"ownership\": [\n");
+    if (written < 0 || (size_t)written >= cap-n) return -1;
+    n += written;
+    for (uint32_t i = 0; i < g->ownership_count; i++) {
+        char escaped[MAX_PATH_LEN * 2];
+        json_escape(g->ownership[i].path,escaped,sizeof(escaped));
+        written = snprintf(json+n,cap-n,
+            "    {\"path\":\"%s\",\"uid\":%u,\"gid\":%u,\"mode\":%u}%s\n",
+            escaped,g->ownership[i].uid,g->ownership[i].gid,g->ownership[i].mode,
+            i + 1 == g->ownership_count ? "" : ",");
+        if (written < 0 || (size_t)written >= cap-n) return -1;
+        n += written;
+    }
+    written = snprintf(json+n,cap-n,"  ]\n}\n");
+    if (written < 0 || (size_t)written >= cap-n) return -1;
+    return n + written;
+}
 int chives_write_export(const char *image, const char *mount, const char *dest,
                         const char *encrypted_name) {
     chives_geometry_t geometry;
@@ -161,7 +221,8 @@ int chives_write_export(const char *image, const char *mount, const char *dest,
     json_escape(encrypted_name, name_esc, sizeof(name_esc));
     uint64_t saved_blocks = sfo_blocks(sfo, (size_t)sfo_size, "SAVEDATA_BLOCKS");
     uint64_t system_blocks = sfo_blocks(sfo, (size_t)sfo_size, "SYSTEM_BLOCKS");
-    char json[3072];
+    if (chives_collect_ownership(mount,"",&geometry) < 0) return -1;
+    char json[CHIVES_MAX_JSON];
     int length = snprintf(json, sizeof(json),
         "{\n  \"schema_version\": 1,\n  \"platform\": \"PS5\",\n"
         "  \"title_id\": \"%s\",\n  \"save_directory\": \"%s\",\n"
@@ -177,6 +238,7 @@ int chives_write_export(const char *image, const char *mount, const char *dest,
         (unsigned long long)geometry.block_count, geometry.mode_raw,
         geometry.backup_header_count, geometry.fs_ext,
         (unsigned long long)saved_blocks, (unsigned long long)system_blocks);
+    length = chives_append_ownership(json,sizeof(json),length,&geometry);
     if (length <= 0 || (size_t)length >= sizeof(json)) return -1;
     char path[MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/chives.json", dest);

@@ -2,6 +2,7 @@
 #define UTIL_H
 
 #include <stdint.h>
+typedef struct chives_geometry_s chives_geometry_t;
 
 #define MAX_PATH_LEN 1024
 #define BUF_SIZE     65536
@@ -10,6 +11,7 @@ void delete_recursive(const char *path);
 int  copy_file(const char *src, const char *dst);
 int  copy_dir_recursive(const char *src, const char *dst);
 int  copy_dir_pfs(const char *src, const char *dst);
+int  copy_dir_pfs_with_geometry(const char *src, const char *dst, const chives_geometry_t *geometry);
 int  copy_dir_pfs_preserve_sce_sys(const char *src, const char *dst);
 int  mkdir_p(const char *path);
 uint64_t count_entries_recursive(const char *dir);

@@ -313,9 +313,8 @@ int save_create_pfs(const char *image_path, uint64_t size, int exact) {
     CreateOpt copt;
     memset(&copt, 0, sizeof(copt));
     sceFsInitCreatePfsSaveDataOpt(&copt);
-    uint8_t ckey[0x20] = {0};
 
-    ret = g_pprCreate(&copt, image_path, 0, img_size, ckey);
+    ret = g_pprCreate(&copt, image_path, 0, img_size);
     if (ret < 0) {
         garlic_log("[Garlic] PprCreate failed (0x%x)\n", ret);
         unlink(image_path);
@@ -535,19 +534,54 @@ int save_mount_new_ps4(const char *image_path) {
     return ret;
 }
 
-/* ── Mount freshly created PFS with zeroed key ─────────────────── */
+/* ── Mount freshly created PFS with its recovered image key ────── */
 int save_mount_new(const char *image_path, const uint8_t *key) {
-    if (g_mounted) save_unmount();
+    if (g_mounted && save_unmount() < 0) return -1;
 
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+    uint8_t caps[16];
+    kernel_get_ucred_caps(getpid(), caps);
+    caps[7] |= 0x40;
+    kernel_set_ucred_caps(getpid(), caps);
+    setuid(0);
+
+    uint8_t ckey[0x20] = {0};
+    if (key) {
+        memcpy(ckey, key, sizeof(ckey));
+    } else {
+        uint8_t *data = calloc(1, 0x100);
+        if (!data) return -1;
+        int fd = open(image_path, O_RDONLY);
+        if (fd < 0 || pread(fd, data, 0x60, 0x800) != 0x60) {
+            if (fd >= 0) close(fd);
+            free(data);
+            garlic_log("[Garlic] Cannot read generated PS5 sealed key\n");
+            return -1;
+        }
+        close(fd);
+        int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+        if (pfsmgr < 0) {
+            free(data);
+            garlic_log("[Garlic] Cannot open pfsmgr for generated PS5 key recovery\n");
+            return -1;
+        }
+        int ret = ioctl(pfsmgr, 0xc0845302, data);
+        int key_errno = errno;
+        close(pfsmgr);
+        if (ret < 0) {
+            free(data);
+            garlic_log("[Garlic] Generated PS5 key recovery failed (ret=%d errno=%d)\n",
+                       ret, key_errno);
+            return -1;
+        }
+        memcpy(ckey, data + 0x60, sizeof(ckey));
+        free(data);
+    }
 
     MountOpt mopt;
     memset(&mopt, 0, sizeof(mopt));
     sceFsInitMountSaveDataOpt(&mopt);
     mopt.budgetid = "system";
-
-    uint8_t ckey[0x20] = {0};
-    if (key) memcpy(ckey, key, sizeof(ckey));
 
     signal(SIGPIPE, SIG_DFL);
     int ret = sceFsMountSaveData(&mopt, image_path, GARLIC_MOUNT_POINT, ckey);
