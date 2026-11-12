@@ -127,7 +127,9 @@ static void worker_self_update(worker_config_t *cfg) {
 #define KEYSTONE_SIZE  0x400
 
 static int account_id_to_sfo_bytes(const char *hex, uint8_t out[8]) {
-    return sfo_account_from_hex(hex, out);
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+    if (strlen(hex) != 16) return -1;
+    return hex_to_bytes(hex, out, 8) == 8 ? 0 : -1;
 }
 
 static int patch_sfo_account_bytes(uint8_t *sfo, size_t size, const uint8_t account[8]) {
@@ -158,54 +160,6 @@ static int patch_sfo_account_bytes(uint8_t *sfo, size_t size, const uint8_t acco
         return memcmp(sfo + value_pos, account, 8) ? -1 : 0;
     }
     return -1;
-}
-
-static int account_id_same_either_endian(const uint8_t actual[8], const uint8_t converted[8]) {
-    if (!memcmp(actual, converted, 8)) return 1;
-    for (int i = 0; i < 8; i++)
-        if (actual[i] != converted[7 - i]) return 0;
-    return 1;
-}
-
-static int sfo_account_matches_file(const char *path, const uint8_t converted[8]) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    off_t offset;
-    uint8_t actual[8];
-    int matched = sfo_field_offset(fd, "ACCOUNT_ID", 0, 8, &offset) == 0 &&
-                pread(fd, actual, 8, offset) == 8 &&
-                account_id_same_either_endian(actual, converted);
-    close(fd);
-    return matched;
-}
-
-static int sfo_account_matches_memory(const uint8_t *sfo, size_t size, const uint8_t converted[8]) {
-    if (!sfo || size < 20 || memcmp(sfo, "\0PSF", 4)) return 0;
-    uint32_t keys, data, count;
-    memcpy(&keys, sfo + 8, 4);
-    memcpy(&data, sfo + 12, 4);
-    memcpy(&count, sfo + 16, 4);
-    if (count > (size - 20) / 16 || keys < 20 + count * 16 || keys >= data || data > size)
-        return 0;
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *entry = sfo + 20 + i * 16;
-        uint16_t key;
-        uint32_t length, capacity, offset;
-        memcpy(&key, entry, 2);
-        memcpy(&length, entry + 4, 4);
-        memcpy(&capacity, entry + 8, 4);
-        memcpy(&offset, entry + 12, 4);
-        uint64_t key_pos = (uint64_t)keys + key;
-        uint64_t value_pos = (uint64_t)data + offset;
-        if (key_pos >= data || length > capacity || value_pos > size ||
-            capacity > size - value_pos) return 0;
-        static const char name[] = "ACCOUNT_ID";
-        if (sizeof(name) > data - key_pos || memcmp(sfo + key_pos, name, sizeof(name)))
-            continue;
-        return length >= 8 && value_pos <= size && 8 <= size - value_pos &&
-               account_id_same_either_endian(sfo + value_pos, converted);
-    }
-    return 0;
 }
 
 /* ── Transport mode (0=HTTP, 1=TCP) ────────────────────────────── */
@@ -1317,10 +1271,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     if (patch_account && (is_ps4_job || !original_geometry.fs_ext)) {
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", mnt);
-        if (sfo_account_matches_file(sfo_path, new_aid)) {
-            patch_account = 0;
-            worker_log(cfg, job_id, "INFO", "Account ID already matches in either byte order; preserving original");
-        } else if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+        if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
             worker_log(cfg, job_id, "ERROR", "Failed to write and verify Account ID in param.sfo");
             save_unmount();
             return -1;
@@ -1333,10 +1284,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
     if (!is_ps4_job && original_geometry.fs_ext && cow_sfo_len) {
         memcpy(enc_sfo, cow_sfo, cow_sfo_len);
         enc_sfo_len = cow_sfo_len;
-        if (patch_account && sfo_account_matches_memory(enc_sfo, enc_sfo_len, new_aid)) {
-            patch_account = 0;
-            worker_log(cfg, job_id, "INFO", "Account ID already matches in either byte order; preserving original");
-        } else if (patch_account && patch_sfo_account_bytes(enc_sfo, enc_sfo_len, new_aid) < 0) {
+        if (patch_account && patch_sfo_account_bytes(enc_sfo, enc_sfo_len, new_aid) < 0) {
             worker_log(cfg, job_id, "ERROR", "Failed to write and verify Account ID in param.sfo");
             save_unmount();
             return -1;
