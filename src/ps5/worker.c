@@ -825,6 +825,49 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             if (chives_write_export(data_path, save_get_mount_point(), result_dir, basename) < 0) {
                 worker_log(cfg, job_id, "WARNING", "Failed to export chives.json geometry");
             }
+            /* CoW saves (fs_ext > 0) need PS5IMAGE + PS5KEY + PS5PARAM_SIZE
+             * for re-encryption.  The zeroed-SFO path above already exports
+             * them; cover the non-zeroed case here. */
+            if (!zero_sfo) {
+                chives_geometry_t dec_geom;
+                if (chives_read_image(data_path, &dec_geom) == 0 && dec_geom.fs_ext) {
+                    char cow_image[MAX_PATH_LEN];
+                    snprintf(cow_image, sizeof(cow_image), "%s/PS5IMAGE", result_dir);
+                    if (copy_file(data_path, cow_image) < 0)
+                        worker_logf(cfg, job_id, "WARNING",
+                                    "Failed to export PS5IMAGE for CoW save %s", basename);
+
+                    uint8_t kd[0x100] = {0};
+                    int kfd = open(data_path, O_RDONLY);
+                    if (kfd >= 0 && pread(kfd, kd, 0x60, 0x800) == 0x60) {
+                        int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+                        if (pfsmgr >= 0) {
+                            if (ioctl(pfsmgr, 0xc0845302, kd) >= 0) {
+                                char kp[MAX_PATH_LEN];
+                                snprintf(kp, sizeof(kp), "%s/PS5KEY", result_dir);
+                                int out = open(kp, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                                if (out >= 0) { write(out, kd + 0x60, 0x20); close(out); }
+                            }
+                            close(pfsmgr);
+                        }
+                    }
+                    if (kfd >= 0) close(kfd);
+
+                    struct stat cow_st;
+                    if (stat(data_path, &cow_st) == 0) {
+                        char sp[MAX_PATH_LEN];
+                        snprintf(sp, sizeof(sp), "%s/PS5PARAM_SIZE", result_dir);
+                        int sfd = open(sp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                        if (sfd >= 0) {
+                            char sz[32];
+                            int sl = snprintf(sz, sizeof(sz), "%llu",
+                                              (unsigned long long)cow_st.st_size);
+                            write(sfd, sz, sl);
+                            close(sfd);
+                        }
+                    }
+                }
+            }
         }
         save_unmount();
         unlink(data_path);
