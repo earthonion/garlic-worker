@@ -235,6 +235,11 @@ static int is_ps5_sidecar(const char *name) {
 }
 
 static int flatten_single_save_directory(const char *files_dir, char *save_name, size_t save_name_size) {
+    char root_sfo[MAX_PATH_LEN];
+    snprintf(root_sfo, sizeof(root_sfo), "%s/sce_sys/param.sfo", files_dir);
+    struct stat root_st;
+    if (stat(root_sfo, &root_st) == 0 && S_ISREG(root_st.st_mode)) return 0;
+
     char preferred[MAX_PATH_LEN] = {0};
     char chives_path[MAX_PATH_LEN], chives_json[CHIVES_MAX_JSON + 1] = {0};
     snprintf(chives_path, sizeof(chives_path), "%s/chives.json", files_dir);
