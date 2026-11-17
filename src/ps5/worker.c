@@ -235,6 +235,17 @@ static int is_ps5_sidecar(const char *name) {
 }
 
 static int flatten_single_save_directory(const char *files_dir, char *save_name, size_t save_name_size) {
+    char preferred[MAX_PATH_LEN] = {0};
+    char chives_path[MAX_PATH_LEN], chives_json[CHIVES_MAX_JSON + 1] = {0};
+    snprintf(chives_path, sizeof(chives_path), "%s/chives.json", files_dir);
+    int chives_fd = open(chives_path, O_RDONLY);
+    if (chives_fd >= 0) {
+        ssize_t chives_size = read(chives_fd, chives_json, CHIVES_MAX_JSON);
+        close(chives_fd);
+        if (chives_size > 0)
+            json_get_string(chives_json, "save_directory", preferred, sizeof(preferred));
+    }
+
     for (;;) {
         DIR *root = opendir(files_dir);
         if (!root) return -1;
@@ -243,10 +254,18 @@ static int flatten_single_save_directory(const char *files_dir, char *save_name,
         struct dirent *ent;
         while ((ent = readdir(root))) {
             if (ent->d_name[0] == '.' || is_ps5_sidecar(ent->d_name)) continue;
+            if (preferred[0] && strcmp(ent->d_name, preferred) != 0) continue;
             entries++;
             snprintf(only, sizeof(only), "%s", ent->d_name);
         }
         closedir(root);
+        if (preferred[0] && !entries) {
+            if (strncmp(preferred, "sdimg_", 6) == 0) return -1;
+            char with_prefix[MAX_PATH_LEN];
+            snprintf(with_prefix, sizeof(with_prefix), "sdimg_%s", preferred);
+            snprintf(preferred, sizeof(preferred), "%s", with_prefix);
+            continue;
+        }
         if (entries != 1) return 0;
 
         char nested[MAX_PATH_LEN],staging[MAX_PATH_LEN];
@@ -273,6 +292,7 @@ static int flatten_single_save_directory(const char *files_dir, char *save_name,
         }
         closedir(sub);
         if (rmdir(staging) < 0) return -1;
+        preferred[0] = '\0';
     }
 }
 
@@ -741,7 +761,10 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
         if (zero_sfo) {
             char sidecar[MAX_PATH_LEN];
             snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", result_dir);
-            if (ps5param_export_blob(data_path, sidecar) < 0) {
+            char nested_sidecar[MAX_PATH_LEN];
+            snprintf(nested_sidecar, sizeof(nested_sidecar), "%s/%s/PS5PARAM", result_dir, basename);
+            if (ps5param_export_blob(data_path, sidecar) < 0 ||
+                ps5param_export_blob(data_path, nested_sidecar) < 0) {
                 worker_logf(cfg, job_id, "WARNING",
                             "Zeroed SFO has no PS5PARAM blob for %s", basename);
                 save_unmount();
@@ -760,6 +783,16 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                     write(sfd, size_text, size_len);
                     close(sfd);
                 }
+                char nested_size[MAX_PATH_LEN];
+                snprintf(nested_size, sizeof(nested_size), "%s/%s/PS5PARAM_SIZE", result_dir, basename);
+                int nested_fd = open(nested_size, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (nested_fd >= 0) {
+                    char size_text[32];
+                    int size_len = snprintf(size_text, sizeof(size_text), "%llu",
+                                            (unsigned long long)image_st.st_size);
+                    write(nested_fd, size_text, size_len);
+                    close(nested_fd);
+                }
             }
 
             uint8_t key_data[0x100] = {0};
@@ -775,6 +808,13 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                             write(out, key_data + 0x60, 0x20);
                             close(out);
                         }
+                        char nested_key[MAX_PATH_LEN];
+                        snprintf(nested_key, sizeof(nested_key), "%s/%s/PS5KEY", result_dir, basename);
+                        int nested_out = open(nested_key, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                        if (nested_out >= 0) {
+                            write(nested_out, key_data + 0x60, 0x20);
+                            close(nested_out);
+                        }
                     }
                     close(pfsmgr);
                 }
@@ -782,7 +822,9 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             if (key_image >= 0) close(key_image);
             char original_image[MAX_PATH_LEN];
             snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", result_dir);
-            if (copy_file(data_path, original_image) < 0) {
+            char nested_image[MAX_PATH_LEN];
+            snprintf(nested_image, sizeof(nested_image), "%s/%s/PS5IMAGE", result_dir, basename);
+            if (copy_file(data_path, nested_image) < 0 || copy_file(data_path, original_image) < 0) {
                 worker_log(cfg, job_id, "ERROR", "Failed to preserve original PFS image");
                 save_unmount();
                 unlink(data_path);
@@ -822,7 +864,10 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                 unlink(data_path);
                 return -1;
             }
-            if (chives_write_export(data_path, save_get_mount_point(), result_dir, basename) < 0) {
+            char nested_chives[MAX_PATH_LEN];
+            snprintf(nested_chives, sizeof(nested_chives), "%s/%s", result_dir, basename);
+            if (chives_write_export(data_path, save_get_mount_point(), result_dir, basename) < 0 ||
+                chives_write_export(data_path, save_get_mount_point(), nested_chives, basename) < 0) {
                 worker_log(cfg, job_id, "WARNING", "Failed to export chives.json geometry");
             }
             /* CoW saves (fs_ext > 0) need PS5IMAGE + PS5KEY + PS5PARAM_SIZE
@@ -833,7 +878,9 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                 if (chives_read_image(data_path, &dec_geom) == 0 && dec_geom.fs_ext) {
                     char cow_image[MAX_PATH_LEN];
                     snprintf(cow_image, sizeof(cow_image), "%s/PS5IMAGE", result_dir);
-                    if (copy_file(data_path, cow_image) < 0)
+                    char nested_cow_image[MAX_PATH_LEN];
+                    snprintf(nested_cow_image, sizeof(nested_cow_image), "%s/%s/PS5IMAGE", result_dir, basename);
+                    if (copy_file(data_path, nested_cow_image) < 0 || copy_file(data_path, cow_image) < 0)
                         worker_logf(cfg, job_id, "WARNING",
                                     "Failed to export PS5IMAGE for CoW save %s", basename);
 
@@ -847,6 +894,10 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                                 snprintf(kp, sizeof(kp), "%s/PS5KEY", result_dir);
                                 int out = open(kp, O_CREAT | O_WRONLY | O_TRUNC, 0600);
                                 if (out >= 0) { write(out, kd + 0x60, 0x20); close(out); }
+                                char nested_kp[MAX_PATH_LEN];
+                                snprintf(nested_kp, sizeof(nested_kp), "%s/%s/PS5KEY", result_dir, basename);
+                                int nested_out = open(nested_kp, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                                if (nested_out >= 0) { write(nested_out, kd + 0x60, 0x20); close(nested_out); }
                             }
                             close(pfsmgr);
                         }
@@ -865,6 +916,19 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                             write(sfd, sz, sl);
                             close(sfd);
                         }
+                        char nested_sp[MAX_PATH_LEN];
+                        snprintf(nested_sp, sizeof(nested_sp), "%s/%s/PS5PARAM_SIZE", result_dir, basename);
+                        int nested_fd = open(nested_sp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                        if (nested_fd >= 0) {
+                            char sz[32];
+                            int sl = snprintf(sz, sizeof(sz), "%llu",
+                                              (unsigned long long)cow_st.st_size);
+                            write(nested_fd, sz, sl);
+                            close(nested_fd);
+                        }
+                        char nested_param[MAX_PATH_LEN];
+                        snprintf(nested_param, sizeof(nested_param), "%s/%s/PS5PARAM", result_dir, basename);
+                        ps5param_export_blob(data_path, nested_param);
                     }
                 }
             }
