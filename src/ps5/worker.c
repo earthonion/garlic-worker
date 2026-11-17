@@ -1202,13 +1202,9 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                                                  : (check_len > 0 ? (uint32_t)check_len : 0);
         }
     }
-    int use_original = (!has_chives || original_geometry.fs_ext) && !is_ps4_job &&
+    int use_original = !original_geometry.fs_ext && (!has_chives || physical_sfo) && !is_ps4_job &&
         has_original_key && original_size > 0 && stat(original_image, &original_st) == 0 &&
         (uint64_t)original_st.st_size == original_size;
-    if (!is_ps4_job && original_geometry.fs_ext && !use_original) {
-        worker_log(cfg, job_id, "ERROR", "CoW encryption requires the original PS5IMAGE and PS5KEY");
-        return -1;
-    }
 
     if (use_original) {
         worker_log(cfg, job_id, "INFO", "Reusing original PS5 PFS image...");
@@ -1346,6 +1342,12 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     if (save_unmount() < 0) {
         worker_log(cfg, job_id, "ERROR", "Cannot finalize save: unmount failed");
+        return -1;
+    }
+    if (!is_ps4_job && has_chives && original_geometry.fs_ext && !use_original &&
+        chives_ppr_convert_cow(img_path, &original_geometry) < 0) {
+        unlink(img_path);
+        worker_log(cfg, job_id, "ERROR", "Cannot finalize the populated CoW image");
         return -1;
     }
     worker_logf(cfg, job_id, "INFO", "PS5PARAM finalization: preserve=%d sidecar=%d enc_sfo_len=%u",

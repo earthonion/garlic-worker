@@ -9,6 +9,7 @@
  * Calls are serialized by Garlic's existing save-operation mutex. */
 int chives_ppr_create(CreateOpt *opt, const char *path, uint64_t size,
                       const chives_geometry_t *expected, int physical_sfo);
+int chives_ppr_convert_cow(const char *path, const chives_geometry_t *expected);
 int finalize_ps5_sfo(const char *image, const uint8_t *sfo, uint32_t size, int fresh);
 
 #endif

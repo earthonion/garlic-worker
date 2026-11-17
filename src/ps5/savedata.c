@@ -23,6 +23,7 @@
 /* ── Globals ───────────────────────────────────────────────────── */
 PprCreateFn g_pprCreate = NULL;
 static int g_mounted = 0;
+static int g_mount_handle = -1;
 static char g_local_copy[MAX_PATH_LEN] = {0};
 
 /* Real param.sfo recovered from PS5PARAM blob (cached per mount) */
@@ -248,6 +249,7 @@ int save_mount(const char *save_path) {
     if (ret >= 0) {
         garlic_log("[Garlic] Mounted %s (handle=%d)\n", mount_src, ret);
         g_mounted = 1;
+        g_mount_handle = ret;
         return 0;
     }
     garlic_log("[Garlic] Mount failed (0x%x, errno=%d)\n", ret, errno);
@@ -261,15 +263,19 @@ int save_unmount(void) {
     UmountOpt uopt;
     memset(&uopt, 0, sizeof(uopt));
     sceFsInitUmountSaveDataOpt(&uopt);
-    int ret = sceFsUmountSaveData(&uopt, GARLIC_MOUNT_POINT, 0, 0);
+    int ret = sceFsUmountSaveData(&uopt, GARLIC_MOUNT_POINT, g_mount_handle, 0);
+    if (ret < 0) {
+        garlic_log("[Garlic] Unmount failed (0x%x, errno=%d, handle=%d)\n",
+                   ret, errno, g_mount_handle);
+        return ret;
+    }
     sync();
-    if (ret < 0)
-        garlic_log("[Garlic] Unmount failed (0x%x, errno=%d)\n", ret, errno);
 
     g_mounted = 0;
+    g_mount_handle = -1;
     g_local_copy[0] = 0;
     g_mount_real_sfo_len = 0;
-    return ret;
+    return 0;
 }
 
 /* ── Create new PFS image ──────────────────────────────────────── */
@@ -330,16 +336,20 @@ int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expe
     if (!expected) return -1;
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
     uint64_t image_size = expected->block_count * (uint64_t)expected->block_size_bytes;
-    int native_allocation = physical_sfo;
+    uint64_t allocation_blocks = expected->block_count - expected->fs_ext;
+    if (expected->fs_ext && (allocation_blocks & ~0xFu))
+        allocation_blocks &= ~0xFu;
+    uint64_t allocation_size = allocation_blocks * (uint64_t)expected->block_size_bytes;
+    int native_allocation = physical_sfo || expected->block_size_bytes == 65536;
     int fd = open(image_path, O_CREAT | O_TRUNC | O_RDWR, 0777);
     if (fd < 0) return -1;
-    int ret = sceFsUfsAllocateSaveData(fd, image_size, native_allocation ? 0x80 : 0, 0);
+    int ret = sceFsUfsAllocateSaveData(fd, allocation_size, native_allocation ? 0x80 : 0, 0);
     if (ret < 0 && native_allocation) {
         close(fd);
         unlink(image_path);
         return -2;
     }
-    if (ret < 0 && ftruncate(fd, image_size) < 0) {
+    if (ret < 0 && ftruncate(fd, allocation_size) < 0) {
         close(fd);
         unlink(image_path);
         return -2;
@@ -356,7 +366,7 @@ int save_create_pfs_chives(const char *image_path, const chives_geometry_t *expe
         unlink(image_path);
         return -3;
     }
-    if (chives_verify_created(image_path, expected) < 0) {
+    if (!expected->fs_ext && chives_verify_created(image_path, expected) < 0) {
         unlink(image_path);
         return -4;
     }
@@ -527,6 +537,7 @@ int save_mount_new_ps4(const char *image_path) {
     if (ret >= 0) {
         garlic_log("[Garlic] Mounted new PS4 PFS (handle=%d)\n", ret);
         g_mounted = 1;
+        g_mount_handle = ret;
         g_local_copy[0] = 0;
         return 0;
     }
@@ -590,6 +601,7 @@ int save_mount_new(const char *image_path, const uint8_t *key) {
     if (ret >= 0) {
         garlic_log("[Garlic] Mounted new PFS (handle=%d)\n", ret);
         g_mounted = 1;
+        g_mount_handle = ret;
         g_local_copy[0] = 0;
         return 0;
     }
@@ -610,6 +622,7 @@ void save_periodic_cleanup(void) {
     sceFsInitUmountSaveDataOpt(&u0);
     sceFsUmountSaveData(&u0, GARLIC_MOUNT_POINT, 0, 0);
     g_mounted = 0;
+    g_mount_handle = -1;
 
     /* Clean up any leftover temp files in /data/save_files/ */
     DIR *d = opendir("/data/save_files");

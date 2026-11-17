@@ -411,7 +411,7 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
 }
 
 int chives_path_safe(const char *name) {
-    if (!name[0] || name[0] == '/' || strchr(name, '\\') || strchr(name, ':'))
+    if (!name[0] || name[0] == '/' || strchr(name, '\\'))
         return 0;
     const char *p = name;
     while (*p) {

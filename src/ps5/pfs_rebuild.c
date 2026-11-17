@@ -176,17 +176,52 @@ int chives_ppr_create(CreateOpt *opt, const char *path, uint64_t size,
     uint32_t data_blocks = (uint32_t)(expected->block_count - system_blocks);
     if (data_blocks < 2 || expected->backup_header_count != 1)
         return -EINVAL;
-    uint64_t data_size = (uint64_t)data_blocks * CMP_PFS_NATIVE_BLOCK_BYTES;
-    garlic_log("[GarlicMgr] CoW create: data=%u system=%u total=%llu expected fs_ext=0x%x\n",
-              data_blocks, system_blocks, (unsigned long long)expected->block_count, system_blocks);
-    int ret = ppr_create(opt, path, 0, data_size);
+    uint32_t initial_blocks = data_blocks & ~0xFu;
+    if (!initial_blocks)
+        initial_blocks = data_blocks;
+    uint64_t initial_size = (uint64_t)initial_blocks * CMP_PFS_NATIVE_BLOCK_BYTES;
+    garlic_log("[GarlicMgr] CoW create: initial=%u data=%u system=%u total=%llu expected fs_ext=0x%x\n",
+              initial_blocks, data_blocks, system_blocks,
+              (unsigned long long)expected->block_count, system_blocks);
+    int ret = ppr_create(opt, path, 0, initial_size);
     if (ret != 0)
         return ret < 0 ? ret : -EIO;
     chives_geometry_t before;
     if (chives_read_image(path, &before) < 0 ||
         before.block_size_bytes != CMP_PFS_NATIVE_BLOCK_BYTES ||
-        before.block_count != data_blocks || !before.has_fs_ext || before.fs_ext != 0)
+        before.block_count != initial_blocks || !before.has_fs_ext || before.fs_ext != 0)
         return -EIO;
+    return 0;
+}
+
+int chives_ppr_convert_cow(const char *path, const chives_geometry_t *expected) {
+    if (!path || !expected || !expected->has_fs_ext || !expected->fs_ext ||
+        expected->block_size_bytes != CMP_PFS_NATIVE_BLOCK_BYTES ||
+        expected->block_count > UINT32_MAX)
+        return -EINVAL;
+    uint32_t system_blocks = expected->fs_ext;
+    uint32_t data_blocks = (uint32_t)(expected->block_count - system_blocks);
+    if (data_blocks < 2 || expected->backup_header_count != 1)
+        return -EINVAL;
+
+    uint32_t initial_blocks = data_blocks & ~0xFu;
+    if (!initial_blocks)
+        initial_blocks = data_blocks;
+    chives_geometry_t before;
+    if (chives_read_image(path, &before) < 0 ||
+        before.block_size_bytes != CMP_PFS_NATIVE_BLOCK_BYTES ||
+        before.block_count != initial_blocks || !before.has_fs_ext || before.fs_ext != 0)
+        return -EIO;
+
+    int image = open(path, O_WRONLY);
+    if (image < 0)
+        return -errno;
+    int resize_result = ftruncate(image, expected->block_count * (uint64_t)expected->block_size_bytes);
+    int resize_errno = errno;
+    close(image);
+    if (resize_result < 0)
+        return -resize_errno;
+
     struct {
         const char *path;
         uint32_t blocks, system_blocks;
@@ -196,15 +231,14 @@ int chives_ppr_create(CreateOpt *opt, const char *path, uint64_t size,
     if (fd < 0)
         return -errno;
     errno = 0;
-    ret = ioctl(fd, CMP_PFS_COW_CONVERT_IOCTL, &arg);
+    int ret = ioctl(fd, CMP_PFS_COW_CONVERT_IOCTL, &arg);
     int saved_errno = errno;
     close(fd);
-    garlic_log("[GarlicMgr] Native CoW conversion: ret=%d errno=%d\n", ret, saved_errno);
+    garlic_log("[GarlicMgr] Native CoW conversion after population: ret=%d errno=%d\n",
+               ret, saved_errno);
     if (ret != 0)
         return saved_errno ? -saved_errno : -EIO;
-    if (chives_verify_created(path, expected) < 0)
-        return -EIO;
-    return 0;
+    return chives_verify_created(path, expected) < 0 ? -EIO : 0;
 }
 
 /* A freshly rebuilt save must have protected metadata unless its source
