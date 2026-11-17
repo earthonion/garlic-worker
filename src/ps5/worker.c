@@ -825,11 +825,9 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
                 }
             }
             if (key_image >= 0) close(key_image);
-            char original_image[MAX_PATH_LEN];
-            snprintf(original_image, sizeof(original_image), "%s/PS5IMAGE", result_dir);
             char nested_image[MAX_PATH_LEN];
             snprintf(nested_image, sizeof(nested_image), "%s/%s/PS5IMAGE", result_dir, basename);
-            if (copy_file(data_path, nested_image) < 0 || copy_file(data_path, original_image) < 0) {
+            if (copy_file(data_path, nested_image) < 0) {
                 worker_log(cfg, job_id, "ERROR", "Failed to preserve original PFS image");
                 save_unmount();
                 unlink(data_path);
@@ -881,11 +879,9 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             if (!zero_sfo) {
                 chives_geometry_t dec_geom;
                 if (chives_read_image(data_path, &dec_geom) == 0 && dec_geom.fs_ext) {
-                    char cow_image[MAX_PATH_LEN];
-                    snprintf(cow_image, sizeof(cow_image), "%s/PS5IMAGE", result_dir);
                     char nested_cow_image[MAX_PATH_LEN];
                     snprintf(nested_cow_image, sizeof(nested_cow_image), "%s/%s/PS5IMAGE", result_dir, basename);
-                    if (copy_file(data_path, nested_cow_image) < 0 || copy_file(data_path, cow_image) < 0)
+                    if (copy_file(data_path, nested_cow_image) < 0)
                         worker_logf(cfg, job_id, "WARNING",
                                     "Failed to export PS5IMAGE for CoW save %s", basename);
 
