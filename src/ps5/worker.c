@@ -241,13 +241,14 @@ static int flatten_single_save_directory(const char *files_dir, char *save_name,
     if (stat(root_sfo, &root_st) == 0 && S_ISREG(root_st.st_mode)) return 0;
 
     char preferred[MAX_PATH_LEN] = {0};
+    if (save_name && save_name[0]) snprintf(preferred, sizeof(preferred), "%s", save_name);
     char chives_path[MAX_PATH_LEN], chives_json[CHIVES_MAX_JSON + 1] = {0};
     snprintf(chives_path, sizeof(chives_path), "%s/chives.json", files_dir);
     int chives_fd = open(chives_path, O_RDONLY);
     if (chives_fd >= 0) {
         ssize_t chives_size = read(chives_fd, chives_json, CHIVES_MAX_JSON);
         close(chives_fd);
-        if (chives_size > 0)
+        if (chives_size > 0 && !preferred[0])
             json_get_string(chives_json, "save_directory", preferred, sizeof(preferred));
     }
 
@@ -798,8 +799,7 @@ static int process_decrypt(worker_config_t *cfg, const char *job_id,
             }
             char nested_chives[MAX_PATH_LEN];
             snprintf(nested_chives, sizeof(nested_chives), "%s/%s", result_dir, basename);
-            if (chives_write_export(data_path, save_get_mount_point(), result_dir, basename) < 0 ||
-                chives_write_export(data_path, save_get_mount_point(), nested_chives, basename) < 0) {
+            if (chives_write_export(data_path, save_get_mount_point(), nested_chives, basename) < 0) {
                 worker_log(cfg, job_id, "WARNING", "Failed to export chives.json geometry");
             }
         }
@@ -960,6 +960,7 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
                            const char *params, const char *work_dir,
                            int is_ps4_job) {
     char savename[256] = {0};
+    json_get_string(params, "savename", savename, sizeof(savename));
     worker_log(cfg, job_id, "INFO", "Downloading files...");
     if (worker_download_files(cfg, job_id, work_dir, savename, sizeof(savename)) < 0) {
         worker_log(cfg, job_id, "ERROR", "Failed to download files");
@@ -968,7 +969,6 @@ static int process_encrypt(worker_config_t *cfg, const char *job_id,
 
     int saveblocks = 0;
     char account_id[64] = {0};
-    json_get_string(params, "savename", savename, sizeof(savename));
     int explicit_savename = savename[0] != '\0';
     json_get_int(params, "saveblocks", &saveblocks);
     json_get_string(params, "account_id", account_id, sizeof(account_id));
