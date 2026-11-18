@@ -251,6 +251,25 @@ static int flatten_single_save_directory(const char *files_dir, char *save_name,
         if (chives_size > 0 && !preferred[0])
             json_get_string(chives_json, "save_directory", preferred, sizeof(preferred));
     }
+    if (!preferred[0]) {
+        DIR *root = opendir(files_dir);
+        if (root) {
+            struct dirent *ent;
+            while ((ent = readdir(root))) {
+                if (ent->d_name[0] == '.') continue;
+                char nested_chives[MAX_PATH_LEN];
+                snprintf(nested_chives, sizeof(nested_chives), "%s/%s/chives.json", files_dir, ent->d_name);
+                if (access(nested_chives, F_OK) == 0) {
+                    if (preferred[0]) {
+                        closedir(root);
+                        return -1;
+                    }
+                    snprintf(preferred, sizeof(preferred), "%s", ent->d_name);
+                }
+            }
+            closedir(root);
+        }
+    }
 
     for (;;) {
         DIR *root = opendir(files_dir);
